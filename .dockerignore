@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.ipynb
+.ipynb_checkpoints/
+.git/
+.DS_Store
+train/
+train_yolo/
+runs/
+local_test/
+saisresult/
+*.zip
+*.tar
+*.tar.gz
