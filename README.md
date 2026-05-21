@@ -40,6 +40,16 @@
 - `models/id_to_chinese.json`
   用于把 HUST-OBC 类别 ID 转成最终提交所需的古文字字符
 
+## Docker
+
+当前 Dockerfile 默认基础镜像为：
+
+```dockerfile
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda:12.0.1-cudnn8-runtime-ubuntu22.04
+```
+
+如果后续你已经把 CUDA 基础镜像同步到了自己的阿里云 ACR，也可以在构建时覆盖这个 `BASE_IMAGE`。
+
 ## 本地测试
 
 ```bash
