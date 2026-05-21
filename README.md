@@ -1,11 +1,56 @@
----
-license: Apache License 2.0
----
-数据集文件元信息以及数据文件，请浏览“数据集文件”页面获取。
+# SAIS OCR Inference
 
-当前数据集卡片使用的是默认模版，数据集的贡献者未提供更加详细的数据集介绍，但是您可以通过如下GIT Clone命令，或者ModelScope SDK来下载数据集
+比赛推理入口已经改为：
+- YOLO 检测模型负责找拓片中的单字框
+- EfficientNet-B0 + ArcFace 分类模型负责识别框内古文字
 
-#### 下载方法 
-:modelscope-code[]{type="sdk"}
-:modelscope-code[]{type="git"}
+## 输入输出
 
+- 输入目录：`/saisdata`
+- 输出文件：`/saisresult/prediction.json`
+- 输出格式：
+
+```json
+{
+  "图片ID": [
+    {
+      "bbox": [x, y, w, h],
+      "text": "字"
+    }
+  ]
+}
+```
+
+## 仓库内必须保留的文件
+
+- `src/run_inference.py`
+- `run.sh`
+- `Dockerfile`
+- `requirements.txt`
+- `models/detector_best.pt`
+- `models/classifier_best.pt`
+- `models/id_to_chinese.json`
+
+## 模型文件说明
+
+- `models/detector_best.pt`
+  来自 YOLO 检测训练结果
+- `models/classifier_best.pt`
+  来自 EfficientNet-B0 + ArcFace 分类训练结果
+- `models/id_to_chinese.json`
+  用于把 HUST-OBC 类别 ID 转成最终提交所需的古文字字符
+
+## 本地测试
+
+```bash
+INPUT_DIR=./local_test/input \
+OUTPUT_FILE=./local_test/result/prediction.json \
+DETECTOR_WEIGHTS=./models/detector_best.pt \
+CLASSIFIER_WEIGHTS=./models/classifier_best.pt \
+ID_TO_CHINESE_FILE=./models/id_to_chinese.json \
+python3 src/run_inference.py
+```
+
+## 说明
+
+分类模型训练时使用的是 HUST-OBC 的真实类别数 `1588`。其中部分合并类在 HUST-OBC 中对应多个近形字符；当前推理实现会使用该合并类的首个 ID 作为稳定输出字符。

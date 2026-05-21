@@ -1,26 +1,50 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import os
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
-from paddleocr import PaddleOCR
-from PIL import Image
+import torch
+from PIL import Image, ImageFile
+from torch import nn
+from torch.nn import functional as F
+from torchvision import models, transforms
+from ultralytics import YOLO
 
 
-INPUT_DIR = Path(os.getenv("INPUT_DIR", "/saisdata/13/eval/images"))
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+INPUT_DIR = Path(os.getenv("INPUT_DIR", "/saisdata"))
 OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
+DETECTOR_WEIGHTS = Path(os.getenv("DETECTOR_WEIGHTS", "/app/models/detector_best.pt"))
+CLASSIFIER_WEIGHTS = Path(os.getenv("CLASSIFIER_WEIGHTS", "/app/models/classifier_best.pt"))
+ID_TO_CHINESE_FILE = Path(os.getenv("ID_TO_CHINESE_FILE", "/app/models/id_to_chinese.json"))
 REQUEST_USE_GPU = os.getenv("USE_GPU", "1") not in {"0", "false", "False", "no", "NO"}
-USE_ANGLE_CLS = os.getenv("USE_ANGLE_CLS", "1") not in {"0", "false", "False", "no", "NO"}
-LANG = os.getenv("PADDLEOCR_LANG", "ch")
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.0"))
+DETECT_CONF = float(os.getenv("DETECT_CONF", "0.20"))
+DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
+DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "1280"))
+MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "4096"))
+CLASSIFY_BATCH_SIZE = int(os.getenv("CLASSIFY_BATCH_SIZE", "128"))
+BOX_EXPAND_RATIO = float(os.getenv("BOX_EXPAND_RATIO", "0.02"))
+IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
+IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 
 
-def find_images():
-    suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+def choose_device() -> str:
+    if REQUEST_USE_GPU and torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
+def find_images() -> list[Path]:
+    suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
     if INPUT_DIR.exists():
-        return sorted(path for path in INPUT_DIR.iterdir() if path.suffix.lower() in suffixes)
+        return sorted(path for path in INPUT_DIR.rglob("*") if path.suffix.lower() in suffixes)
 
     fallback_root = Path("/saisdata")
     if fallback_root.exists():
@@ -29,153 +53,200 @@ def find_images():
     return []
 
 
-def normalize_ocr_lines(result):
-    if not result:
-        return []
+class ArcMarginProduct(nn.Module):
+    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.35) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        self.s = s
+        self.m = m
 
-    if isinstance(result, list) and len(result) == 1:
-        return result[0] or []
+    def infer(self, embeddings: torch.Tensor) -> torch.Tensor:
+        cosine = F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        return cosine * self.s
 
-    return result if isinstance(result, list) else []
+
+class EfficientNetArcFace(nn.Module):
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        backbone = models.efficientnet_b0(weights=None)
+        in_features = backbone.classifier[1].in_features
+        backbone.classifier = nn.Identity()
+        self.backbone = backbone
+        self.embedding = nn.Sequential(
+            nn.Linear(in_features, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        embeddings = self.embedding(features)
+        return F.normalize(embeddings)
 
 
-def detect_use_gpu():
-    if not REQUEST_USE_GPU:
-        print("GPU disabled by USE_GPU=0")
-        return False
+@dataclass
+class Detection:
+    bbox: list[int]
+    crop: Image.Image
 
-    try:
-        import paddle
 
-        is_cuda_build = False
-        for checker in (
-            lambda: paddle.device.is_compiled_with_cuda(),
-            lambda: paddle.is_compiled_with_cuda(),
-        ):
-            try:
-                is_cuda_build = bool(checker())
-                break
-            except Exception:
+class AncientCharRecognizer:
+    def __init__(self, detector_weights: Path, classifier_weights: Path, id_to_chinese_file: Path, device: str) -> None:
+        if not detector_weights.exists():
+            raise FileNotFoundError(f"Detector weights not found: {detector_weights}")
+        if not classifier_weights.exists():
+            raise FileNotFoundError(f"Classifier weights not found: {classifier_weights}")
+        if not id_to_chinese_file.exists():
+            raise FileNotFoundError(f"ID-to-character mapping not found: {id_to_chinese_file}")
+
+        self.device = torch.device(device)
+        self.detector = YOLO(str(detector_weights))
+
+        checkpoint = torch.load(classifier_weights, map_location="cpu", weights_only=False)
+        label_map: dict[str, int] = checkpoint["label_map"]
+        embedding_dim = int(checkpoint["args"]["embedding_dim"])
+        arcface_s = float(checkpoint["args"]["arcface_s"])
+        arcface_m = float(checkpoint["args"]["arcface_m"])
+        num_classes = len(label_map)
+
+        self.classifier = EfficientNetArcFace(embedding_dim=embedding_dim).to(self.device)
+        self.arcface = ArcMarginProduct(
+            in_features=embedding_dim,
+            out_features=num_classes,
+            s=arcface_s,
+            m=arcface_m,
+        ).to(self.device)
+        self.classifier.load_state_dict(checkpoint["model_state_dict"])
+        self.arcface.load_state_dict(checkpoint["arcface_state_dict"])
+        self.classifier.eval()
+        self.arcface.eval()
+
+        id_to_chinese: dict[str, str] = json.loads(id_to_chinese_file.read_text(encoding="utf-8"))
+        self.idx_to_text = self._build_idx_to_text(label_map, id_to_chinese)
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((128, 128)),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
+            ]
+        )
+
+    @staticmethod
+    def _build_idx_to_text(label_map: dict[str, int], id_to_chinese: dict[str, str]) -> dict[int, str]:
+        idx_to_text: dict[int, str] = {}
+        for class_name, index in label_map.items():
+            primary_id = class_name.split("_")[0]
+            text = id_to_chinese.get(primary_id, "")
+            if not text:
+                print(f"Warning: missing text mapping for class '{class_name}', falling back to empty string.")
+            idx_to_text[int(index)] = text
+        return idx_to_text
+
+    def _predict_texts(self, crops: Iterable[Image.Image]) -> list[str]:
+        tensors = [self.transform(crop.convert("RGB")) for crop in crops]
+        if not tensors:
+            return []
+
+        results: list[str] = []
+        with torch.inference_mode():
+            for start in range(0, len(tensors), CLASSIFY_BATCH_SIZE):
+                batch = torch.stack(tensors[start : start + CLASSIFY_BATCH_SIZE]).to(self.device)
+                embeddings = self.classifier(batch)
+                logits = self.arcface.infer(embeddings)
+                pred_indices = logits.argmax(dim=1).tolist()
+                results.extend(self.idx_to_text.get(int(index), "") for index in pred_indices)
+        return results
+
+    def _expand_and_clip_box(self, x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> list[int]:
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        expand_x = box_w * BOX_EXPAND_RATIO
+        expand_y = box_h * BOX_EXPAND_RATIO
+
+        left = max(0, int(round(x1 - expand_x)))
+        top = max(0, int(round(y1 - expand_y)))
+        right = min(width, int(round(x2 + expand_x)))
+        bottom = min(height, int(round(y2 + expand_y)))
+        return [left, top, max(0, right - left), max(0, bottom - top)]
+
+    def detect_and_recognize(self, image_path: Path) -> list[dict]:
+        with Image.open(image_path) as image:
+            rgb_image = image.convert("RGB")
+            image_width, image_height = rgb_image.size
+
+            prediction = self.detector.predict(
+                source=str(image_path),
+                conf=DETECT_CONF,
+                iou=DETECT_IOU,
+                imgsz=DETECT_IMGSZ,
+                max_det=MAX_DETECTIONS,
+                device=0 if self.device.type == "cuda" else "cpu",
+                verbose=False,
+            )[0]
+
+            detections: list[Detection] = []
+            boxes = prediction.boxes.xyxy.tolist() if prediction.boxes is not None else []
+            for box in boxes:
+                x1, y1, x2, y2 = box
+                bbox = self._expand_and_clip_box(x1, y1, x2, y2, image_width, image_height)
+                x, y, w, h = bbox
+                if w <= 0 or h <= 0:
+                    continue
+                crop = rgb_image.crop((x, y, x + w, y + h))
+                detections.append(Detection(bbox=bbox, crop=crop))
+
+        texts = self._predict_texts([item.crop for item in detections])
+        results: list[dict] = []
+        for detection, text in zip(detections, texts):
+            if not text:
                 continue
+            results.append({"bbox": detection.bbox, "text": text})
 
-        try:
-            gpu_count = int(paddle.device.cuda.device_count())
-        except Exception:
-            gpu_count = 0
-
-        print(f"Paddle CUDA build: {is_cuda_build}")
-        print(f"Visible CUDA devices: {gpu_count}")
-
-        if is_cuda_build and gpu_count > 0:
-            return True
-    except Exception as exc:
-        print(f"Warning: failed to check CUDA devices: {exc}")
-
-    print("GPU requested but no usable CUDA device was found; falling back to CPU.")
-    return False
+        results.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+        return results
 
 
-def polygon_to_bbox(points, image_width, image_height):
-    x_values = [float(point[0]) for point in points]
-    y_values = [float(point[1]) for point in points]
-
-    x1 = max(0, min(image_width - 1, int(round(min(x_values)))))
-    y1 = max(0, min(image_height - 1, int(round(min(y_values)))))
-    x2 = max(0, min(image_width, int(round(max(x_values)))))
-    y2 = max(0, min(image_height, int(round(max(y_values)))))
-
-    return [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
-
-
-def infer_one(ocr, image_path):
-    with Image.open(image_path) as img:
-        image_width, image_height = img.size
-
-    raw_result = ocr.ocr(str(image_path), cls=USE_ANGLE_CLS)
-    lines = normalize_ocr_lines(raw_result)
-
-    detections = []
-    for line in lines:
-        if not line or len(line) < 2:
-            continue
-
-        polygon = line[0]
-        text_score = line[1]
-        text = text_score[0] if text_score else ""
-        score = float(text_score[1]) if text_score and len(text_score) > 1 else 0.0
-
-        if not text or score < MIN_SCORE:
-            continue
-
-        bbox = polygon_to_bbox(polygon, image_width, image_height)
-        if bbox[2] <= 0 or bbox[3] <= 0:
-            continue
-
-        detections.append({
-            "bbox": [int(v) for v in bbox],
-            "text": str(text),
-        })
-
-    detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
-    return detections
-
-
-def main():
+def main() -> None:
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     image_paths = find_images()
     print(f"Input directory: {INPUT_DIR}")
     print(f"Images found: {len(image_paths)}")
-    use_gpu = detect_use_gpu()
-    print(f"Use GPU requested: {REQUEST_USE_GPU}")
-    print(f"Use GPU actual: {use_gpu}")
-    print(f"Use angle classifier: {USE_ANGLE_CLS}")
-    print(f"Language: {LANG}")
-    print(f"Min score: {MIN_SCORE}")
+    print(f"Detector weights: {DETECTOR_WEIGHTS}")
+    print(f"Classifier weights: {CLASSIFIER_WEIGHTS}")
+    print(f"Character mapping: {ID_TO_CHINESE_FILE}")
 
-    results = {}
     if not image_paths:
-        print("No images found; writing an empty prediction file.")
-        with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Saved: {OUTPUT_FILE}")
+        OUTPUT_FILE.write_text("{}", encoding="utf-8")
+        print(f"No images found. Saved empty result to {OUTPUT_FILE}")
         return
 
-    try:
-        ocr = PaddleOCR(
-            use_angle_cls=USE_ANGLE_CLS,
-            lang=LANG,
-            use_gpu=use_gpu,
-            show_log=False,
-        )
-    except Exception:
-        if not use_gpu:
-            raise
-        print("Warning: failed to initialize PaddleOCR with GPU; retrying on CPU.")
-        traceback.print_exc()
-        use_gpu = False
-        ocr = PaddleOCR(
-            use_angle_cls=USE_ANGLE_CLS,
-            lang=LANG,
-            use_gpu=False,
-            show_log=False,
-        )
+    device = choose_device()
+    print(f"Use GPU requested: {REQUEST_USE_GPU}")
+    print(f"Use device actual: {device}")
 
+    recognizer = AncientCharRecognizer(
+        detector_weights=DETECTOR_WEIGHTS,
+        classifier_weights=CLASSIFIER_WEIGHTS,
+        id_to_chinese_file=ID_TO_CHINESE_FILE,
+        device=device,
+    )
+
+    predictions: dict[str, list[dict]] = {}
     for index, image_path in enumerate(image_paths, start=1):
         if index == 1 or index % 50 == 0:
             print(f"[{index}/{len(image_paths)}] {image_path.name}")
-
-        image_id = image_path.stem
         try:
-            results[image_id] = infer_one(ocr, image_path)
+            predictions[image_path.stem] = recognizer.detect_and_recognize(image_path)
         except Exception as exc:
             print(f"Warning: failed to process {image_path}: {exc}")
             traceback.print_exc()
-            results[image_id] = []
+            predictions[image_path.stem] = []
 
-    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
+    OUTPUT_FILE.write_text(
+        json.dumps(predictions, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     print(f"Saved: {OUTPUT_FILE}")
 
 

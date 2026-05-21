@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "Starting official PaddleOCR baseline inference..."
+echo "Starting YOLO + classifier inference..."
 
 echo "===== Runtime paths ====="
 echo "PWD=$(pwd)"
@@ -78,24 +78,15 @@ except Exception as exc:
     print("CUDA driver API check failed:", repr(exc))
 
 try:
-    import paddle
+    import torch
 
-    print("Paddle version:", paddle.__version__)
-    try:
-        print("Paddle compiled with CUDA:", paddle.device.is_compiled_with_cuda())
-    except Exception as exc:
-        print("Paddle CUDA compile check failed:", repr(exc))
-    try:
-        print("Paddle CUDA device count:", paddle.device.cuda.device_count())
-    except Exception as exc:
-        print("Paddle CUDA device count failed:", repr(exc))
-    try:
-        paddle.device.set_device("gpu:0")
-        print("Paddle set_device gpu:0: OK")
-    except Exception as exc:
-        print("Paddle set_device gpu:0 failed:", repr(exc))
+    print("Torch version:", torch.__version__)
+    print("Torch CUDA available:", torch.cuda.is_available())
+    print("Torch device count:", torch.cuda.device_count())
+    if torch.cuda.is_available():
+        print("Torch device 0:", torch.cuda.get_device_name(0))
 except Exception as exc:
-    print("Paddle import/check failed:", repr(exc))
+    print("Torch import/check failed:", repr(exc))
 PY
 echo "===== End GPU diagnostics ====="
 

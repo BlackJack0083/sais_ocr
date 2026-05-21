@@ -1,0 +1,11 @@
+data/
+runs/
+*.pt
+*.pyc
+!models/
+!models/*.pt
+!models/*.json
+
+pycache/
+__pycache__/
+*.log
