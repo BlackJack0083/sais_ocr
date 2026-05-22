@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-from PIL import Image, ImageFile
+from PIL import Image, ImageFile, ImageOps
 from torch import nn
 from torch.nn import functional as F
 from torchvision import models, transforms
@@ -90,14 +90,24 @@ class Detection:
     crop: Image.Image
 
 
+def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
+    width, height = image.size
+    if width == height:
+        return image
+    side = max(width, height)
+    pad_left = (side - width) // 2
+    pad_top = (side - height) // 2
+    pad_right = side - width - pad_left
+    pad_bottom = side - height - pad_top
+    return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
+
+
 class AncientCharRecognizer:
     def __init__(self, detector_weights: Path, classifier_weights: Path, id_to_chinese_file: Path, device: str) -> None:
         if not detector_weights.exists():
             raise FileNotFoundError(f"Detector weights not found: {detector_weights}")
         if not classifier_weights.exists():
             raise FileNotFoundError(f"Classifier weights not found: {classifier_weights}")
-        if not id_to_chinese_file.exists():
-            raise FileNotFoundError(f"ID-to-character mapping not found: {id_to_chinese_file}")
 
         self.device = torch.device(device)
         self.detector = YOLO(str(detector_weights))
@@ -121,10 +131,13 @@ class AncientCharRecognizer:
         self.classifier.eval()
         self.arcface.eval()
 
-        id_to_chinese: dict[str, str] = json.loads(id_to_chinese_file.read_text(encoding="utf-8"))
+        id_to_chinese: dict[str, str] | None = None
+        if id_to_chinese_file.exists():
+            id_to_chinese = json.loads(id_to_chinese_file.read_text(encoding="utf-8"))
         self.idx_to_text = self._build_idx_to_text(label_map, id_to_chinese)
         self.transform = transforms.Compose(
             [
+                transforms.Lambda(pad_to_square),
                 transforms.Resize((128, 128)),
                 transforms.ToTensor(),
                 transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
@@ -132,13 +145,26 @@ class AncientCharRecognizer:
         )
 
     @staticmethod
-    def _build_idx_to_text(label_map: dict[str, int], id_to_chinese: dict[str, str]) -> dict[int, str]:
+    def _build_idx_to_text(label_map: dict[str, int], id_to_chinese: dict[str, str] | None) -> dict[int, str]:
+        use_direct_labels = id_to_chinese is None
+        if id_to_chinese is not None:
+            sample_keys = list(label_map.keys())
+            matched = sum(1 for class_name in sample_keys if class_name.split("_")[0] in id_to_chinese)
+            use_direct_labels = matched < max(1, len(sample_keys) // 2)
+            if use_direct_labels:
+                print("Classifier label mode: direct Unicode labels")
+            else:
+                print("Classifier label mode: ID-to-character mapping")
+
         idx_to_text: dict[int, str] = {}
         for class_name, index in label_map.items():
-            primary_id = class_name.split("_")[0]
-            text = id_to_chinese.get(primary_id, "")
-            if not text:
-                print(f"Warning: missing text mapping for class '{class_name}', falling back to empty string.")
+            if use_direct_labels:
+                text = class_name
+            else:
+                primary_id = class_name.split("_")[0]
+                text = id_to_chinese.get(primary_id, "") if id_to_chinese is not None else ""
+                if not text:
+                    print(f"Warning: missing text mapping for class '{class_name}', falling back to empty string.")
             idx_to_text[int(index)] = text
         return idx_to_text
 

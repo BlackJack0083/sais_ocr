@@ -9,3 +9,4 @@ runs/
 pycache/
 __pycache__/
 *.log
+.env
