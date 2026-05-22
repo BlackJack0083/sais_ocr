@@ -23,12 +23,14 @@ OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
 DETECTOR_WEIGHTS = Path(os.getenv("DETECTOR_WEIGHTS", "/app/models/detector_best.pt"))
 CLASSIFIER_WEIGHTS = Path(os.getenv("CLASSIFIER_WEIGHTS", "/app/models/classifier_best.pt"))
 REQUEST_USE_GPU = os.getenv("USE_GPU", "1") not in {"0", "false", "False", "no", "NO"}
-DETECT_CONF = float(os.getenv("DETECT_CONF", "0.20"))
-DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
+DETECT_CONF = float(os.getenv("DETECT_CONF", "0.12"))
+DETECT_IOU = float(os.getenv("DETECT_IOU", "0.45"))
 DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "1280"))
 MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "4096"))
 CLASSIFY_BATCH_SIZE = int(os.getenv("CLASSIFY_BATCH_SIZE", "128"))
-BOX_EXPAND_RATIO = float(os.getenv("BOX_EXPAND_RATIO", "0.02"))
+BOX_EXPAND_RATIO = float(os.getenv("BOX_EXPAND_RATIO", "0.00"))
+CLASSIFY_MIN_PROB = float(os.getenv("CLASSIFY_MIN_PROB", "0.20"))
+CLASSIFY_MIN_MARGIN = float(os.getenv("CLASSIFY_MIN_MARGIN", "0.00"))
 IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
 IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 
@@ -156,8 +158,20 @@ class AncientCharRecognizer:
                 batch = torch.stack(tensors[start : start + CLASSIFY_BATCH_SIZE]).to(self.device)
                 embeddings = self.classifier(batch)
                 logits = self.arcface.infer(embeddings)
-                pred_indices = logits.argmax(dim=1).tolist()
-                results.extend(self.idx_to_text.get(int(index), "") for index in pred_indices)
+                probs = logits.softmax(dim=1)
+                top2_probs, top2_indices = probs.topk(k=min(2, probs.shape[1]), dim=1)
+                pred_indices = top2_indices[:, 0].tolist()
+                pred_probs = top2_probs[:, 0].tolist()
+                if top2_probs.shape[1] > 1:
+                    pred_margins = (top2_probs[:, 0] - top2_probs[:, 1]).tolist()
+                else:
+                    pred_margins = pred_probs
+
+                for pred_index, pred_prob, pred_margin in zip(pred_indices, pred_probs, pred_margins):
+                    if pred_prob < CLASSIFY_MIN_PROB or pred_margin < CLASSIFY_MIN_MARGIN:
+                        results.append("")
+                        continue
+                    results.append(self.idx_to_text.get(int(pred_index), ""))
         return results
 
     def _expand_and_clip_box(self, x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> list[int]:
@@ -217,6 +231,9 @@ def main() -> None:
     print(f"Images found: {len(image_paths)}")
     print(f"Detector weights: {DETECTOR_WEIGHTS}")
     print(f"Classifier weights: {CLASSIFIER_WEIGHTS}")
+    print(f"BOX_EXPAND_RATIO={BOX_EXPAND_RATIO}")
+    print(f"CLASSIFY_MIN_PROB={CLASSIFY_MIN_PROB}")
+    print(f"CLASSIFY_MIN_MARGIN={CLASSIFY_MIN_MARGIN}")
 
     if not image_paths:
         OUTPUT_FILE.write_text("{}", encoding="utf-8")
