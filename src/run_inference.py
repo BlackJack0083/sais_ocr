@@ -22,7 +22,6 @@ INPUT_DIR = Path(os.getenv("INPUT_DIR", "/saisdata"))
 OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
 DETECTOR_WEIGHTS = Path(os.getenv("DETECTOR_WEIGHTS", "/app/models/detector_best.pt"))
 CLASSIFIER_WEIGHTS = Path(os.getenv("CLASSIFIER_WEIGHTS", "/app/models/classifier_best.pt"))
-ID_TO_CHINESE_FILE = Path(os.getenv("ID_TO_CHINESE_FILE", "/app/models/id_to_chinese.json"))
 REQUEST_USE_GPU = os.getenv("USE_GPU", "1") not in {"0", "false", "False", "no", "NO"}
 DETECT_CONF = float(os.getenv("DETECT_CONF", "0.20"))
 DETECT_IOU = float(os.getenv("DETECT_IOU", "0.50"))
@@ -103,7 +102,7 @@ def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 25
 
 
 class AncientCharRecognizer:
-    def __init__(self, detector_weights: Path, classifier_weights: Path, id_to_chinese_file: Path, device: str) -> None:
+    def __init__(self, detector_weights: Path, classifier_weights: Path, device: str) -> None:
         if not detector_weights.exists():
             raise FileNotFoundError(f"Detector weights not found: {detector_weights}")
         if not classifier_weights.exists():
@@ -131,10 +130,7 @@ class AncientCharRecognizer:
         self.classifier.eval()
         self.arcface.eval()
 
-        id_to_chinese: dict[str, str] | None = None
-        if id_to_chinese_file.exists():
-            id_to_chinese = json.loads(id_to_chinese_file.read_text(encoding="utf-8"))
-        self.idx_to_text = self._build_idx_to_text(label_map, id_to_chinese)
+        self.idx_to_text = self._build_idx_to_text(label_map)
         self.transform = transforms.Compose(
             [
                 transforms.Lambda(pad_to_square),
@@ -145,28 +141,9 @@ class AncientCharRecognizer:
         )
 
     @staticmethod
-    def _build_idx_to_text(label_map: dict[str, int], id_to_chinese: dict[str, str] | None) -> dict[int, str]:
-        use_direct_labels = id_to_chinese is None
-        if id_to_chinese is not None:
-            sample_keys = list(label_map.keys())
-            matched = sum(1 for class_name in sample_keys if class_name.split("_")[0] in id_to_chinese)
-            use_direct_labels = matched < max(1, len(sample_keys) // 2)
-            if use_direct_labels:
-                print("Classifier label mode: direct Unicode labels")
-            else:
-                print("Classifier label mode: ID-to-character mapping")
-
-        idx_to_text: dict[int, str] = {}
-        for class_name, index in label_map.items():
-            if use_direct_labels:
-                text = class_name
-            else:
-                primary_id = class_name.split("_")[0]
-                text = id_to_chinese.get(primary_id, "") if id_to_chinese is not None else ""
-                if not text:
-                    print(f"Warning: missing text mapping for class '{class_name}', falling back to empty string.")
-            idx_to_text[int(index)] = text
-        return idx_to_text
+    def _build_idx_to_text(label_map: dict[str, int]) -> dict[int, str]:
+        print("Classifier label mode: direct Unicode labels")
+        return {int(index): class_name for class_name, index in label_map.items()}
 
     def _predict_texts(self, crops: Iterable[Image.Image]) -> list[str]:
         tensors = [self.transform(crop.convert("RGB")) for crop in crops]
@@ -240,7 +217,6 @@ def main() -> None:
     print(f"Images found: {len(image_paths)}")
     print(f"Detector weights: {DETECTOR_WEIGHTS}")
     print(f"Classifier weights: {CLASSIFIER_WEIGHTS}")
-    print(f"Character mapping: {ID_TO_CHINESE_FILE}")
 
     if not image_paths:
         OUTPUT_FILE.write_text("{}", encoding="utf-8")
@@ -254,7 +230,6 @@ def main() -> None:
     recognizer = AncientCharRecognizer(
         detector_weights=DETECTOR_WEIGHTS,
         classifier_weights=CLASSIFIER_WEIGHTS,
-        id_to_chinese_file=ID_TO_CHINESE_FILE,
         device=device,
     )
 

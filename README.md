@@ -29,7 +29,6 @@
 - `requirements.txt`
 - `models/detector_best.pt`
 - `models/classifier_best.pt`
-- `models/id_to_chinese.json`
 
 ## 模型文件说明
 
@@ -37,8 +36,7 @@
   来自 YOLO 检测训练结果
 - `models/classifier_best.pt`
   来自 EfficientNet-B0 + ArcFace 分类训练结果
-- `models/id_to_chinese.json`
-  用于把 HUST-OBC 类别 ID 转成最终提交所需的古文字字符
+  分类器的 `label_map` 直接使用 Unicode 字符作为类别名，推理时会直接输出这些字符
 
 ## Docker
 
@@ -57,10 +55,9 @@ INPUT_DIR=./local_test/input \
 OUTPUT_FILE=./local_test/result/prediction.json \
 DETECTOR_WEIGHTS=./models/detector_best.pt \
 CLASSIFIER_WEIGHTS=./models/classifier_best.pt \
-ID_TO_CHINESE_FILE=./models/id_to_chinese.json \
 python3 src/run_inference.py
 ```
 
 ## 说明
 
-分类模型训练时使用的是 HUST-OBC 的真实类别数 `1588`。其中部分合并类在 HUST-OBC 中对应多个近形字符；当前推理实现会使用该合并类的首个 ID 作为稳定输出字符。
+当前提交版分类器基于比赛训练集裁字重训，输出类别直接对应 Unicode 古文字字符。
