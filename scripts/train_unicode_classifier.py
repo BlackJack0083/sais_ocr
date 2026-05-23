@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import random
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arcface-s", type=float, default=30.0)
     parser.add_argument("--arcface-m", type=float, default=0.35)
     parser.add_argument("--init-backbone-from", type=Path, default=None)
+    parser.add_argument("--class-balanced-sampler", type=str, default="none", choices=["none", "inv_sqrt"])
+    parser.add_argument("--loss", type=str, default="cross_entropy", choices=["cross_entropy", "balanced_softmax"])
+    parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--resume-from", type=Path, default=None, help="Resume full training state from a previous checkpoint.")
     parser.add_argument(
         "--resume-optimizer-state",
@@ -82,6 +86,7 @@ class JsonImageDataset(Dataset):
             ]
         )
         self.transform = transforms.Compose(base)
+        self.class_counts = Counter(sample.label for sample in self.samples)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -162,6 +167,18 @@ class EfficientNetArcFace(nn.Module):
         return F.normalize(embeddings)
 
 
+class BalancedSoftmaxLoss(nn.Module):
+    def __init__(self, class_counts: list[int]) -> None:
+        super().__init__()
+        counts = torch.tensor(class_counts, dtype=torch.float32)
+        counts = torch.clamp(counts, min=1.0)
+        self.register_buffer("log_class_counts", counts.log())
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        adjusted_logits = logits + self.log_class_counts.to(logits.device)
+        return F.cross_entropy(adjusted_logits, labels)
+
+
 def load_backbone_init(model: EfficientNetArcFace, init_path: Path | None) -> None:
     if init_path is None:
         return
@@ -239,10 +256,22 @@ def main() -> None:
     val_dataset = JsonImageDataset(args.val_json, args.img_size, train=False)
     print(f"Loaded datasets: train={len(train_dataset)} val={len(val_dataset)}", flush=True)
 
+    sampler = None
+    shuffle = True
+    if args.class_balanced_sampler == "inv_sqrt":
+        sample_weights = [1.0 / math.sqrt(max(train_dataset.class_counts[sample.label], 1)) for sample in train_dataset.samples]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        shuffle = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
@@ -270,12 +299,20 @@ def main() -> None:
     if args.resume_from is None:
         load_backbone_init(model, args.init_backbone_from)
 
+    if args.freeze_backbone:
+        for parameter in model.backbone.parameters():
+            parameter.requires_grad = False
+
     model = model.to(device)
     arcface = arcface.to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    class_counts = [train_dataset.class_counts.get(label, 0) for label in range(num_classes)]
+    if args.loss == "balanced_softmax":
+        criterion = BalancedSoftmaxLoss(class_counts=class_counts)
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(arcface.parameters()),
+        [parameter for parameter in list(model.parameters()) + list(arcface.parameters()) if parameter.requires_grad],
         lr=args.lr,
         weight_decay=args.weight_decay,
     )

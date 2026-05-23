@@ -59,10 +59,11 @@ python3 src/run_inference.py
 ```
 
 当前默认推理参数已经调到一组更优的本地验证配置：
-- `DETECT_CONF=0.12`
-- `DETECT_IOU=0.45`
+- `DETECT_CONF=0.08`
+- `DETECT_IOU=0.40`
 - `BOX_EXPAND_RATIO=0.00`
-- `CLASSIFY_MIN_PROB=0.20`
+- `CLASSIFY_MIN_PROB=0.33`
+- `CLASSIFY_MIN_MARGIN=0.07`
 
 如需覆盖，可通过环境变量传入。
 

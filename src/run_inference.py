@@ -23,14 +23,18 @@ OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
 DETECTOR_WEIGHTS = Path(os.getenv("DETECTOR_WEIGHTS", "/app/models/detector_best.pt"))
 CLASSIFIER_WEIGHTS = Path(os.getenv("CLASSIFIER_WEIGHTS", "/app/models/classifier_best.pt"))
 REQUEST_USE_GPU = os.getenv("USE_GPU", "1") not in {"0", "false", "False", "no", "NO"}
-DETECT_CONF = float(os.getenv("DETECT_CONF", "0.12"))
-DETECT_IOU = float(os.getenv("DETECT_IOU", "0.45"))
+DETECT_CONF = float(os.getenv("DETECT_CONF", "0.08"))
+DETECT_IOU = float(os.getenv("DETECT_IOU", "0.40"))
 DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "1280"))
 MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "4096"))
 CLASSIFY_BATCH_SIZE = int(os.getenv("CLASSIFY_BATCH_SIZE", "128"))
 BOX_EXPAND_RATIO = float(os.getenv("BOX_EXPAND_RATIO", "0.00"))
-CLASSIFY_MIN_PROB = float(os.getenv("CLASSIFY_MIN_PROB", "0.20"))
-CLASSIFY_MIN_MARGIN = float(os.getenv("CLASSIFY_MIN_MARGIN", "0.00"))
+CLASSIFY_MIN_PROB = float(os.getenv("CLASSIFY_MIN_PROB", "0.33"))
+CLASSIFY_MIN_MARGIN = float(os.getenv("CLASSIFY_MIN_MARGIN", "0.07"))
+SLICE_SIZE = int(os.getenv("SLICE_SIZE", "0"))
+SLICE_OVERLAP = int(os.getenv("SLICE_OVERLAP", "0"))
+SLICE_MERGE_IOU = float(os.getenv("SLICE_MERGE_IOU", "0.50"))
+DET_TTA_MODE = os.getenv("DET_TTA_MODE", "none")
 IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
 IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 
@@ -91,6 +95,12 @@ class Detection:
     crop: Image.Image
 
 
+@dataclass
+class DetectionBox:
+    bbox: list[int]
+    score: float
+
+
 def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
     width, height = image.size
     if width == height:
@@ -101,6 +111,48 @@ def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 25
     pad_right = side - width - pad_left
     pad_bottom = side - height - pad_top
     return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
+
+
+def iou_xywh(a: list[int], b: list[int]) -> float:
+    ax1, ay1, aw, ah = a
+    bx1, by1, bw, bh = b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def nms_boxes(boxes: list[DetectionBox], iou_threshold: float) -> list[DetectionBox]:
+    if not boxes:
+        return []
+    remaining = sorted(boxes, key=lambda item: item.score, reverse=True)
+    kept: list[DetectionBox] = []
+    while remaining:
+        current = remaining.pop(0)
+        kept.append(current)
+        filtered: list[DetectionBox] = []
+        for candidate in remaining:
+            if iou_xywh(current.bbox, candidate.bbox) < iou_threshold:
+                filtered.append(candidate)
+        remaining = filtered
+    return kept
+
+
+def sliding_starts(length: int, window: int, overlap: int) -> list[int]:
+    if window <= 0 or length <= window:
+        return [0]
+    stride = max(1, window - overlap)
+    starts = list(range(0, max(length - window, 0) + 1, stride))
+    if starts[-1] != length - window:
+        starts.append(length - window)
+    return starts
 
 
 class AncientCharRecognizer:
@@ -186,25 +238,100 @@ class AncientCharRecognizer:
         bottom = min(height, int(round(y2 + expand_y)))
         return [left, top, max(0, right - left), max(0, bottom - top)]
 
+    def _detector_device(self) -> int | str:
+        return 0 if self.device.type == "cuda" else "cpu"
+
+    def _predict_raw_boxes(self, image: Image.Image, imgsz: int) -> list[DetectionBox]:
+        prediction = self.detector.predict(
+            source=image,
+            conf=DETECT_CONF,
+            iou=DETECT_IOU,
+            imgsz=imgsz,
+            max_det=MAX_DETECTIONS,
+            device=self._detector_device(),
+            verbose=False,
+        )[0]
+        if prediction.boxes is None:
+            return []
+        coords = prediction.boxes.xyxy.tolist()
+        scores = prediction.boxes.conf.tolist()
+        boxes: list[DetectionBox] = []
+        for (x1, y1, x2, y2), score in zip(coords, scores):
+            boxes.append(
+                DetectionBox(
+                    bbox=[
+                        int(round(x1)),
+                        int(round(y1)),
+                        max(0, int(round(x2)) - int(round(x1))),
+                        max(0, int(round(y2)) - int(round(y1))),
+                    ],
+                    score=float(score),
+                )
+            )
+        return boxes
+
+    def _predict_full_image_boxes(self, rgb_image: Image.Image) -> list[DetectionBox]:
+        image_width, _ = rgb_image.size
+        boxes: list[DetectionBox] = []
+
+        def add_view(view: Image.Image, imgsz: int, flipped: bool) -> None:
+            for box in self._predict_raw_boxes(view, imgsz=imgsz):
+                x, y, w, h = box.bbox
+                if flipped:
+                    x = image_width - (x + w)
+                boxes.append(DetectionBox(bbox=[x, y, w, h], score=box.score))
+
+        add_view(rgb_image, imgsz=DETECT_IMGSZ, flipped=False)
+        if DET_TTA_MODE in {"hflip", "hflip+scale1536"}:
+            add_view(rgb_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=DETECT_IMGSZ, flipped=True)
+        if DET_TTA_MODE in {"scale1536", "hflip+scale1536"}:
+            add_view(rgb_image, imgsz=1536, flipped=False)
+        if DET_TTA_MODE == "hflip+scale1536":
+            add_view(rgb_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=1536, flipped=True)
+        return boxes
+
+    def _predict_sliced_boxes(self, rgb_image: Image.Image) -> list[DetectionBox]:
+        if SLICE_SIZE <= 0:
+            return []
+        width, height = rgb_image.size
+        boxes: list[DetectionBox] = []
+        for top in sliding_starts(height, SLICE_SIZE, SLICE_OVERLAP):
+            for left in sliding_starts(width, SLICE_SIZE, SLICE_OVERLAP):
+                right = min(width, left + SLICE_SIZE)
+                bottom = min(height, top + SLICE_SIZE)
+                tile = rgb_image.crop((left, top, right, bottom))
+                for box in self._predict_raw_boxes(tile, imgsz=SLICE_SIZE):
+                    x, y, w, h = box.bbox
+                    boxes.append(DetectionBox(bbox=[x + left, y + top, w, h], score=box.score))
+        return boxes
+
+    def _merge_boxes(self, boxes: list[DetectionBox], width: int, height: int) -> list[list[int]]:
+        merged = nms_boxes(boxes, iou_threshold=SLICE_MERGE_IOU)
+        clipped: list[list[int]] = []
+        for box in merged:
+            x, y, w, h = box.bbox
+            x1 = max(0, x)
+            y1 = max(0, y)
+            x2 = min(width, x + w)
+            y2 = min(height, y + h)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            clipped.append([x1, y1, x2 - x1, y2 - y1])
+        return clipped
+
     def detect_and_recognize(self, image_path: Path) -> list[dict]:
         with Image.open(image_path) as image:
             rgb_image = image.convert("RGB")
             image_width, image_height = rgb_image.size
-
-            prediction = self.detector.predict(
-                source=str(image_path),
-                conf=DETECT_CONF,
-                iou=DETECT_IOU,
-                imgsz=DETECT_IMGSZ,
-                max_det=MAX_DETECTIONS,
-                device=0 if self.device.type == "cuda" else "cpu",
-                verbose=False,
-            )[0]
-
             detections: list[Detection] = []
-            boxes = prediction.boxes.xyxy.tolist() if prediction.boxes is not None else []
-            for box in boxes:
-                x1, y1, x2, y2 = box
+            merged_boxes = self._merge_boxes(
+                self._predict_full_image_boxes(rgb_image) + self._predict_sliced_boxes(rgb_image),
+                width=image_width,
+                height=image_height,
+            )
+            for x1, y1, w, h in merged_boxes:
+                x2 = x1 + w
+                y2 = y1 + h
                 bbox = self._expand_and_clip_box(x1, y1, x2, y2, image_width, image_height)
                 x, y, w, h = bbox
                 if w <= 0 or h <= 0:
@@ -234,6 +361,10 @@ def main() -> None:
     print(f"BOX_EXPAND_RATIO={BOX_EXPAND_RATIO}")
     print(f"CLASSIFY_MIN_PROB={CLASSIFY_MIN_PROB}")
     print(f"CLASSIFY_MIN_MARGIN={CLASSIFY_MIN_MARGIN}")
+    print(f"SLICE_SIZE={SLICE_SIZE}")
+    print(f"SLICE_OVERLAP={SLICE_OVERLAP}")
+    print(f"SLICE_MERGE_IOU={SLICE_MERGE_IOU}")
+    print(f"DET_TTA_MODE={DET_TTA_MODE}")
 
     if not image_paths:
         OUTPUT_FILE.write_text("{}", encoding="utf-8")

@@ -29,6 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cls-min-margin-values", type=str, default="0.00,0.02,0.05,0.08")
     parser.add_argument("--det-imgsz", type=int, default=1280)
     parser.add_argument("--cls-batch-size", type=int, default=128)
+    parser.add_argument("--slice-size", type=int, default=0)
+    parser.add_argument("--slice-overlap", type=int, default=0)
+    parser.add_argument("--slice-merge-iou", type=float, default=0.50)
+    parser.add_argument("--det-tta-mode", type=str, default="none")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--output-csv", type=Path, default=Path("reports/sweep_end_to_end_results.csv"))
     parser.add_argument("--top-k", type=int, default=20)
@@ -64,6 +68,14 @@ def build_command(args: argparse.Namespace, config: dict[str, float]) -> list[st
         str(config["cls_min_margin"]),
         "--box-expand-ratio",
         str(config["box_expand_ratio"]),
+        "--slice-size",
+        str(args.slice_size),
+        "--slice-overlap",
+        str(args.slice_overlap),
+        "--slice-merge-iou",
+        str(args.slice_merge_iou),
+        "--det-tta-mode",
+        args.det_tta_mode,
         "--iou-threshold",
         str(args.iou_threshold),
     ]
@@ -108,6 +120,7 @@ def main() -> None:
         "precision",
         "recall",
         "f1",
+        "elapsed_sec",
         "iou_threshold",
         "num_images",
         "total_gt_chars",

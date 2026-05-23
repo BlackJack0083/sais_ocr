@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,12 @@ IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 class Item:
     bbox: list[int]
     text: str
+
+
+@dataclass
+class DetectionBox:
+    bbox: list[int]
+    score: float
 
 
 class ArcMarginProduct(nn.Module):
@@ -70,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cls-min-prob", type=float, default=0.0)
     parser.add_argument("--cls-min-margin", type=float, default=0.0)
     parser.add_argument("--box-expand-ratio", type=float, default=0.02)
+    parser.add_argument("--slice-size", type=int, default=0)
+    parser.add_argument("--slice-overlap", type=int, default=0)
+    parser.add_argument("--slice-merge-iou", type=float, default=0.50)
+    parser.add_argument("--det-tta-mode", type=str, default="none")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     return parser.parse_args()
 
@@ -121,6 +132,11 @@ def xyxy_to_xywh(box: list[int]) -> list[int]:
     return [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
 
 
+def xywh_to_xyxy(box: list[int]) -> list[int]:
+    x, y, w, h = box
+    return [x, y, x + w, y + h]
+
+
 def iou_xywh(a: list[int], b: list[int]) -> float:
     ax1, ay1, aw, ah = a
     bx1, by1, bw, bh = b
@@ -135,6 +151,33 @@ def iou_xywh(a: list[int], b: list[int]) -> float:
     inter = inter_w * inter_h
     union = aw * ah + bw * bh - inter
     return inter / union if union > 0 else 0.0
+
+
+def nms_boxes(boxes: list[DetectionBox], iou_threshold: float) -> list[DetectionBox]:
+    if not boxes:
+        return []
+
+    remaining = sorted(boxes, key=lambda item: item.score, reverse=True)
+    kept: list[DetectionBox] = []
+    while remaining:
+        current = remaining.pop(0)
+        kept.append(current)
+        filtered: list[DetectionBox] = []
+        for candidate in remaining:
+            if iou_xywh(current.bbox, candidate.bbox) < iou_threshold:
+                filtered.append(candidate)
+        remaining = filtered
+    return kept
+
+
+def sliding_starts(length: int, window: int, overlap: int) -> list[int]:
+    if window <= 0 or length <= window:
+        return [0]
+    stride = max(1, window - overlap)
+    starts = list(range(0, max(length - window, 0) + 1, stride))
+    if starts[-1] != length - window:
+        starts.append(length - window)
+    return starts
 
 
 def load_ground_truth(xml_path: Path) -> list[Item]:
@@ -164,6 +207,10 @@ class Recognizer:
         cls_min_prob: float,
         cls_min_margin: float,
         box_expand_ratio: float,
+        slice_size: int,
+        slice_overlap: int,
+        slice_merge_iou: float,
+        det_tta_mode: str,
     ) -> None:
         self.detector = YOLO(str(detector_weights))
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -188,6 +235,10 @@ class Recognizer:
         self.cls_min_prob = cls_min_prob
         self.cls_min_margin = cls_min_margin
         self.box_expand_ratio = box_expand_ratio
+        self.slice_size = slice_size
+        self.slice_overlap = slice_overlap
+        self.slice_merge_iou = slice_merge_iou
+        self.det_tta_mode = det_tta_mode
         self.transform = transforms.Compose(
             [
                 transforms.Lambda(pad_to_square),
@@ -208,29 +259,100 @@ class Recognizer:
         bottom = min(height, int(round(y2 + expand_y)))
         return [left, top, max(0, right - left), max(0, bottom - top)]
 
+    def _detector_device(self) -> int | str:
+        return 0 if self.device.type == "cuda" else "cpu"
+
+    def _predict_raw_boxes(self, image: Image.Image, imgsz: int) -> list[DetectionBox]:
+        prediction = self.detector.predict(
+            source=image,
+            conf=self.det_conf,
+            iou=self.det_iou,
+            imgsz=imgsz,
+            device=self._detector_device(),
+            verbose=False,
+        )[0]
+        if prediction.boxes is None:
+            return []
+
+        coords = prediction.boxes.xyxy.tolist()
+        scores = prediction.boxes.conf.tolist()
+        boxes: list[DetectionBox] = []
+        for (x1, y1, x2, y2), score in zip(coords, scores):
+            boxes.append(DetectionBox(bbox=xyxy_to_xywh([int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]), score=float(score)))
+        return boxes
+
+    def _predict_full_image_boxes(self, rgb: Image.Image) -> list[DetectionBox]:
+        image_width, _ = rgb.size
+        all_boxes: list[DetectionBox] = []
+
+        def add_view_boxes(view: Image.Image, imgsz: int, flipped: bool) -> None:
+            raw_boxes = self._predict_raw_boxes(view, imgsz=imgsz)
+            for box in raw_boxes:
+                x, y, w, h = box.bbox
+                if flipped:
+                    x = image_width - (x + w)
+                all_boxes.append(DetectionBox(bbox=[x, y, w, h], score=box.score))
+
+        add_view_boxes(rgb, imgsz=self.det_imgsz, flipped=False)
+        if self.det_tta_mode in {"hflip", "hflip+scale1536"}:
+            add_view_boxes(rgb.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=self.det_imgsz, flipped=True)
+        if self.det_tta_mode in {"scale1536", "hflip+scale1536"}:
+            add_view_boxes(rgb, imgsz=1536, flipped=False)
+        if self.det_tta_mode == "hflip+scale1536":
+            add_view_boxes(rgb.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=1536, flipped=True)
+        return all_boxes
+
+    def _predict_sliced_boxes(self, rgb: Image.Image) -> list[DetectionBox]:
+        width, height = rgb.size
+        if self.slice_size <= 0:
+            return []
+
+        boxes: list[DetectionBox] = []
+        x_starts = sliding_starts(width, self.slice_size, self.slice_overlap)
+        y_starts = sliding_starts(height, self.slice_size, self.slice_overlap)
+        for top in y_starts:
+            for left in x_starts:
+                right = min(width, left + self.slice_size)
+                bottom = min(height, top + self.slice_size)
+                tile = rgb.crop((left, top, right, bottom))
+                for box in self._predict_raw_boxes(tile, imgsz=self.slice_size):
+                    x, y, w, h = box.bbox
+                    boxes.append(DetectionBox(bbox=[x + left, y + top, w, h], score=box.score))
+        return boxes
+
+    def _merge_boxes(self, boxes: list[DetectionBox], width: int, height: int) -> list[list[int]]:
+        merged = nms_boxes(boxes, iou_threshold=self.slice_merge_iou)
+        clipped: list[list[int]] = []
+        for box in merged:
+            x, y, w, h = box.bbox
+            x1 = max(0, x)
+            y1 = max(0, y)
+            x2 = min(width, x + w)
+            y2 = min(height, y + h)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            clipped.append([x1, y1, x2 - x1, y2 - y1])
+        return clipped
+
     def predict(self, image_path: Path) -> list[Item]:
         with Image.open(image_path) as image:
             rgb = image.convert("RGB")
             image_width, image_height = rgb.size
-            prediction = self.detector.predict(
-                source=str(image_path),
-                conf=self.det_conf,
-                iou=self.det_iou,
-                imgsz=self.det_imgsz,
-                device=0 if self.device.type == "cuda" else "cpu",
-                verbose=False,
-            )[0]
-            boxes = prediction.boxes.xyxy.tolist() if prediction.boxes is not None else []
+            merged_boxes = self._merge_boxes(
+                self._predict_full_image_boxes(rgb) + self._predict_sliced_boxes(rgb),
+                width=image_width,
+                height=image_height,
+            )
 
             xywh_boxes: list[list[int]] = []
             crops = []
-            for x1, y1, x2, y2 in boxes:
-                bbox = self._expand_box(x1, y1, x2, y2, image_width, image_height)
-                x1i, y1i, w, h = bbox
-                if w <= 0 or h <= 0:
+            for x, y, w, h in merged_boxes:
+                expanded = self._expand_box(x, y, x + w, y + h, image_width, image_height)
+                x1i, y1i, ew, eh = expanded
+                if ew <= 0 or eh <= 0:
                     continue
-                xywh_boxes.append(bbox)
-                crops.append(self.transform(rgb.crop((x1i, y1i, x1i + w, y1i + h))))
+                xywh_boxes.append(expanded)
+                crops.append(self.transform(rgb.crop((x1i, y1i, x1i + ew, y1i + eh))))
 
         texts: list[str] = []
         if crops:
@@ -294,11 +416,16 @@ def main() -> None:
         cls_min_prob=args.cls_min_prob,
         cls_min_margin=args.cls_min_margin,
         box_expand_ratio=args.box_expand_ratio,
+        slice_size=args.slice_size,
+        slice_overlap=args.slice_overlap,
+        slice_merge_iou=args.slice_merge_iou,
+        det_tta_mode=args.det_tta_mode,
     )
 
     total_tp = total_fp = total_fn = 0
     total_gt = total_pred = 0
     image_paths = sorted(path for path in args.images_dir.iterdir() if path.is_file())
+    started_at = time.perf_counter()
 
     for index, image_path in enumerate(image_paths, start=1):
         xml_path = (args.source_root / image_path.name).with_suffix(".xml")
@@ -329,6 +456,7 @@ def main() -> None:
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "elapsed_sec": time.perf_counter() - started_at,
         "iou_threshold": args.iou_threshold,
         "num_images": len(image_paths),
         "total_gt_chars": total_gt,
