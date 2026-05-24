@@ -29,12 +29,13 @@ DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "1280"))
 MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "4096"))
 CLASSIFY_BATCH_SIZE = int(os.getenv("CLASSIFY_BATCH_SIZE", "128"))
 BOX_EXPAND_RATIO = float(os.getenv("BOX_EXPAND_RATIO", "0.00"))
-CLASSIFY_MIN_PROB = float(os.getenv("CLASSIFY_MIN_PROB", "0.33"))
+CLASSIFY_MIN_PROB = float(os.getenv("CLASSIFY_MIN_PROB", "0.38"))
 CLASSIFY_MIN_MARGIN = float(os.getenv("CLASSIFY_MIN_MARGIN", "0.07"))
+CLASSIFY_MIN_COS = float(os.getenv("CLASSIFY_MIN_COS", "0.0"))
 SLICE_SIZE = int(os.getenv("SLICE_SIZE", "0"))
 SLICE_OVERLAP = int(os.getenv("SLICE_OVERLAP", "0"))
 SLICE_MERGE_IOU = float(os.getenv("SLICE_MERGE_IOU", "0.50"))
-DET_TTA_MODE = os.getenv("DET_TTA_MODE", "none")
+DET_TTA_MODE = os.getenv("DET_TTA_MODE", "scale1536")
 IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
 IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 
@@ -167,9 +168,11 @@ class AncientCharRecognizer:
 
         checkpoint = torch.load(classifier_weights, map_location="cpu", weights_only=False)
         label_map: dict[str, int] = checkpoint["label_map"]
-        embedding_dim = int(checkpoint["args"]["embedding_dim"])
-        arcface_s = float(checkpoint["args"]["arcface_s"])
-        arcface_m = float(checkpoint["args"]["arcface_m"])
+        checkpoint_args = checkpoint.get("args", {})
+        embedding_dim = int(checkpoint_args["embedding_dim"])
+        arcface_s = float(checkpoint_args["arcface_s"])
+        arcface_m = float(checkpoint_args["arcface_m"])
+        self.classifier_img_size = int(checkpoint_args.get("img_size", 128))
         num_classes = len(label_map)
 
         self.classifier = EfficientNetArcFace(embedding_dim=embedding_dim).to(self.device)
@@ -188,7 +191,7 @@ class AncientCharRecognizer:
         self.transform = transforms.Compose(
             [
                 transforms.Lambda(pad_to_square),
-                transforms.Resize((128, 128)),
+                transforms.Resize((self.classifier_img_size, self.classifier_img_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
             ]
@@ -210,8 +213,10 @@ class AncientCharRecognizer:
                 batch = torch.stack(tensors[start : start + CLASSIFY_BATCH_SIZE]).to(self.device)
                 embeddings = self.classifier(batch)
                 logits = self.arcface.infer(embeddings)
+                cosines = logits / self.arcface.s
                 probs = logits.softmax(dim=1)
                 top2_probs, top2_indices = probs.topk(k=min(2, probs.shape[1]), dim=1)
+                top1_cosines = cosines.gather(1, top2_indices[:, :1]).squeeze(1).tolist()
                 pred_indices = top2_indices[:, 0].tolist()
                 pred_probs = top2_probs[:, 0].tolist()
                 if top2_probs.shape[1] > 1:
@@ -219,8 +224,14 @@ class AncientCharRecognizer:
                 else:
                     pred_margins = pred_probs
 
-                for pred_index, pred_prob, pred_margin in zip(pred_indices, pred_probs, pred_margins):
-                    if pred_prob < CLASSIFY_MIN_PROB or pred_margin < CLASSIFY_MIN_MARGIN:
+                for pred_index, pred_prob, pred_margin, pred_cos in zip(
+                    pred_indices, pred_probs, pred_margins, top1_cosines
+                ):
+                    if (
+                        pred_prob < CLASSIFY_MIN_PROB
+                        or pred_margin < CLASSIFY_MIN_MARGIN
+                        or pred_cos < CLASSIFY_MIN_COS
+                    ):
                         results.append("")
                         continue
                     results.append(self.idx_to_text.get(int(pred_index), ""))
@@ -361,6 +372,7 @@ def main() -> None:
     print(f"BOX_EXPAND_RATIO={BOX_EXPAND_RATIO}")
     print(f"CLASSIFY_MIN_PROB={CLASSIFY_MIN_PROB}")
     print(f"CLASSIFY_MIN_MARGIN={CLASSIFY_MIN_MARGIN}")
+    print(f"CLASSIFY_MIN_COS={CLASSIFY_MIN_COS}")
     print(f"SLICE_SIZE={SLICE_SIZE}")
     print(f"SLICE_OVERLAP={SLICE_OVERLAP}")
     print(f"SLICE_MERGE_IOU={SLICE_MERGE_IOU}")

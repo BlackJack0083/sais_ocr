@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--box-expand-values", type=str, default="0.00,0.01,0.02,0.04,0.06")
     parser.add_argument("--cls-min-prob-values", type=str, default="0.00,0.10,0.15,0.20,0.25")
     parser.add_argument("--cls-min-margin-values", type=str, default="0.00,0.02,0.05,0.08")
+    parser.add_argument("--cls-min-cos-values", type=str, default="0.00")
     parser.add_argument("--det-imgsz", type=int, default=1280)
     parser.add_argument("--cls-batch-size", type=int, default=128)
     parser.add_argument("--slice-size", type=int, default=0)
@@ -66,6 +67,8 @@ def build_command(args: argparse.Namespace, config: dict[str, float]) -> list[st
         str(config["cls_min_prob"]),
         "--cls-min-margin",
         str(config["cls_min_margin"]),
+        "--cls-min-cos",
+        str(config["cls_min_cos"]),
         "--box-expand-ratio",
         str(config["box_expand_ratio"]),
         "--slice-size",
@@ -95,6 +98,7 @@ def main() -> None:
     box_expand_values = parse_float_list(args.box_expand_values)
     cls_min_prob_values = parse_float_list(args.cls_min_prob_values)
     cls_min_margin_values = parse_float_list(args.cls_min_margin_values)
+    cls_min_cos_values = parse_float_list(args.cls_min_cos_values)
 
     configs = list(
         itertools.product(
@@ -103,6 +107,7 @@ def main() -> None:
             box_expand_values,
             cls_min_prob_values,
             cls_min_margin_values,
+            cls_min_cos_values,
         )
     )
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +119,7 @@ def main() -> None:
         "box_expand_ratio",
         "cls_min_prob",
         "cls_min_margin",
+        "cls_min_cos",
         "tp",
         "fp",
         "fn",
@@ -139,6 +145,7 @@ def main() -> None:
             "box_expand_ratio": values[2],
             "cls_min_prob": values[3],
             "cls_min_margin": values[4],
+            "cls_min_cos": values[5],
         }
         print(f"[{index}/{len(configs)}] {config}", flush=True)
         completed = subprocess.run(

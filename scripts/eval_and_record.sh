@@ -32,6 +32,7 @@ CUDA_VISIBLE_DEVICES="$cuda_visible_devices" uv run python scripts/evaluate_end_
   --cls-batch-size 128 \
   --cls-min-prob 0.33 \
   --cls-min-margin 0.07 \
+  --cls-min-cos 0.00 \
   --box-expand-ratio 0.00 \
   "$@" > "$log_file" 2>&1
 

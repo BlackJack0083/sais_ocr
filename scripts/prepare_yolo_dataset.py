@@ -5,6 +5,7 @@ import argparse
 import random
 import shutil
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting.")
     parser.add_argument("--copy-images", action="store_true", help="Copy images instead of symlink.")
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="random",
+        choices=["random", "group"],
+        help="How to split train/val. 'group' keeps same source groups in only one split.",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +135,44 @@ def parse_xml(xml_path: Path) -> Sample | None:
     return Sample(image_path=image_path, label_lines=label_lines)
 
 
+def extract_group_key(path: Path) -> str:
+    parts = path.stem.split("-")
+    if len(parts) >= 3:
+        return parts[2].split("_")[0]
+    return path.stem
+
+
+def split_samples(samples: list[Sample], val_ratio: float, seed: int, split_mode: str) -> tuple[list[Sample], list[Sample]]:
+    rng = random.Random(seed)
+    if split_mode == "random":
+        shuffled = samples[:]
+        rng.shuffle(shuffled)
+        val_count = int(len(shuffled) * val_ratio)
+        return shuffled[val_count:], shuffled[:val_count]
+
+    grouped: dict[str, list[Sample]] = defaultdict(list)
+    for sample in samples:
+        grouped[extract_group_key(sample.image_path)].append(sample)
+
+    group_items = list(grouped.items())
+    rng.shuffle(group_items)
+    group_items.sort(key=lambda item: len(item[1]), reverse=True)
+
+    target_val = int(len(samples) * val_ratio)
+    val_samples: list[Sample] = []
+    train_samples: list[Sample] = []
+    val_size = 0
+
+    for _, group_samples in group_items:
+        if val_size < target_val:
+            val_samples.extend(group_samples)
+            val_size += len(group_samples)
+        else:
+            train_samples.extend(group_samples)
+
+    return train_samples, val_samples
+
+
 def ensure_clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -179,10 +225,12 @@ def main() -> None:
         if index % 1000 == 0:
             print(f"Parsed {index}/{len(xml_paths)} XML files")
 
-    random.Random(args.seed).shuffle(samples)
-    val_count = int(len(samples) * args.val_ratio)
-    val_samples = samples[:val_count]
-    train_samples = samples[val_count:]
+    train_samples, val_samples = split_samples(
+        samples=samples,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        split_mode=args.split_mode,
+    )
 
     for split in ("train", "val"):
         ensure_clean_dir(output_root / "images" / split)
@@ -206,6 +254,7 @@ def main() -> None:
     print(f"Val samples: {len(val_samples)}")
     print(f"Skipped XML without paired image: {skipped_missing_image}")
     print(f"Skipped XML without valid boxes: {skipped_empty}")
+    print(f"Split mode: {args.split_mode}")
     print(f"Dataset YAML: {output_root / 'dataset.yaml'}")
 
 

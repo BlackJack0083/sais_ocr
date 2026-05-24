@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cls-batch-size", type=int, default=128)
     parser.add_argument("--cls-min-prob", type=float, default=0.0)
     parser.add_argument("--cls-min-margin", type=float, default=0.0)
+    parser.add_argument("--cls-min-cos", type=float, default=0.0)
     parser.add_argument("--box-expand-ratio", type=float, default=0.02)
     parser.add_argument("--slice-size", type=int, default=0)
     parser.add_argument("--slice-overlap", type=int, default=0)
@@ -206,6 +207,7 @@ class Recognizer:
         cls_batch_size: int,
         cls_min_prob: float,
         cls_min_margin: float,
+        cls_min_cos: float,
         box_expand_ratio: float,
         slice_size: int,
         slice_overlap: int,
@@ -216,24 +218,27 @@ class Recognizer:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(classifier_weights, map_location="cpu", weights_only=False)
         label_map: dict[str, int] = ckpt["label_map"]
+        checkpoint_args = ckpt.get("args", {})
         self.idx_to_text = {int(idx): text for text, idx in label_map.items()}
-        self.model = EfficientNetArcFace(int(ckpt["args"]["embedding_dim"])).to(self.device)
+        self.model = EfficientNetArcFace(int(checkpoint_args["embedding_dim"])).to(self.device)
         self.arcface = ArcMarginProduct(
-            in_features=int(ckpt["args"]["embedding_dim"]),
+            in_features=int(checkpoint_args["embedding_dim"]),
             out_features=len(label_map),
-            s=float(ckpt["args"]["arcface_s"]),
-            m=float(ckpt["args"]["arcface_m"]),
+            s=float(checkpoint_args["arcface_s"]),
+            m=float(checkpoint_args["arcface_m"]),
         ).to(self.device)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.arcface.load_state_dict(ckpt["arcface_state_dict"])
         self.model.eval()
         self.arcface.eval()
+        self.classifier_img_size = int(checkpoint_args.get("img_size", 128))
         self.det_conf = det_conf
         self.det_iou = det_iou
         self.det_imgsz = det_imgsz
         self.cls_batch_size = cls_batch_size
         self.cls_min_prob = cls_min_prob
         self.cls_min_margin = cls_min_margin
+        self.cls_min_cos = cls_min_cos
         self.box_expand_ratio = box_expand_ratio
         self.slice_size = slice_size
         self.slice_overlap = slice_overlap
@@ -242,7 +247,7 @@ class Recognizer:
         self.transform = transforms.Compose(
             [
                 transforms.Lambda(pad_to_square),
-                transforms.Resize((128, 128)),
+                transforms.Resize((self.classifier_img_size, self.classifier_img_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
             ]
@@ -360,8 +365,10 @@ class Recognizer:
                 for start in range(0, len(crops), self.cls_batch_size):
                     batch = torch.stack(crops[start : start + self.cls_batch_size]).to(self.device)
                     logits = self.arcface.infer(self.model(batch))
+                    cosines = logits / self.arcface.s
                     probs = logits.softmax(dim=1)
                     top2_probs, top2_indices = probs.topk(k=min(2, probs.shape[1]), dim=1)
+                    top1_cosines = cosines.gather(1, top2_indices[:, :1]).squeeze(1).tolist()
                     pred_indices = top2_indices[:, 0].tolist()
                     pred_probs = top2_probs[:, 0].tolist()
                     if top2_probs.shape[1] > 1:
@@ -369,8 +376,14 @@ class Recognizer:
                     else:
                         pred_margins = pred_probs
 
-                    for pred_index, pred_prob, pred_margin in zip(pred_indices, pred_probs, pred_margins):
-                        if pred_prob < self.cls_min_prob or pred_margin < self.cls_min_margin:
+                    for pred_index, pred_prob, pred_margin, pred_cos in zip(
+                        pred_indices, pred_probs, pred_margins, top1_cosines
+                    ):
+                        if (
+                            pred_prob < self.cls_min_prob
+                            or pred_margin < self.cls_min_margin
+                            or pred_cos < self.cls_min_cos
+                        ):
                             texts.append("")
                             continue
                         texts.append(self.idx_to_text[int(pred_index)])
@@ -415,6 +428,7 @@ def main() -> None:
         cls_batch_size=args.cls_batch_size,
         cls_min_prob=args.cls_min_prob,
         cls_min_margin=args.cls_min_margin,
+        cls_min_cos=args.cls_min_cos,
         box_expand_ratio=args.box_expand_ratio,
         slice_size=args.slice_size,
         slice_overlap=args.slice_overlap,

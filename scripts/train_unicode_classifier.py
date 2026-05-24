@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--resume-from", type=Path, default=None, help="Resume full training state from a previous checkpoint.")
     parser.add_argument(
+        "--reset-best-on-resume",
+        action="store_true",
+        help="Ignore historical best validation accuracy from the resumed checkpoint and re-select best.pt under the current validation setup.",
+    )
+    parser.add_argument(
         "--resume-optimizer-state",
         action="store_true",
         help="Also restore optimizer and scheduler state. Leave off when extending a finished run whose LR already decayed to zero.",
@@ -326,6 +331,9 @@ def main() -> None:
         resume_path=args.resume_from,
         resume_optimizer_state=args.resume_optimizer_state,
     )
+    if args.reset_best_on_resume:
+        best_val_acc = 0.0
+        print("Reset best validation accuracy after resume.", flush=True)
     if args.epochs <= start_epoch:
         raise ValueError(f"--epochs ({args.epochs}) must be greater than resume epoch ({start_epoch}).")
 

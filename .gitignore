@@ -10,3 +10,4 @@ pycache/
 __pycache__/
 *.log
 .env
+reports/
