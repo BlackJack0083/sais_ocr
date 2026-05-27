@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -14,6 +16,13 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision import models, transforms
 from ultralytics import YOLO
+
+EDGECRAFTER_ROOT = Path("/mnt/data/hejiakai/external_src/EdgeCrafter-main/ecdetseg")
+if EDGECRAFTER_ROOT.exists():
+    edgecrafter_root_str = str(EDGECRAFTER_ROOT)
+    if edgecrafter_root_str not in sys.path:
+        sys.path.append(edgecrafter_root_str)
+    from engine.core.yaml_config import YAMLConfig
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -31,6 +40,24 @@ class Item:
 class DetectionBox:
     bbox: list[int]
     score: float
+
+
+class EdgeCrafterDeployedModel(nn.Module):
+    def __init__(self, config_path: Path, checkpoint_path: Path) -> None:
+        super().__init__()
+        cfg = YAMLConfig(str(config_path), resume=str(checkpoint_path))
+        cfg.yaml_cfg["ViTAdapter"]["skip_load_backbone"] = True
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state = checkpoint["ema"]["module"] if "ema" in checkpoint else checkpoint["model"]
+        cfg.model.load_state_dict(state)
+        self.model = cfg.model.deploy()
+        self.postprocessor = cfg.postprocessor.deploy()
+        self.eval_spatial_size = tuple(int(v) for v in cfg.yaml_cfg["eval_spatial_size"])
+        self.task = str(cfg.yaml_cfg["task"])
+
+    def forward(self, images: torch.Tensor, orig_target_sizes: torch.Tensor):
+        outputs = self.model(images)
+        return self.postprocessor(outputs, orig_target_sizes)
 
 
 class ArcMarginProduct(nn.Module):
@@ -67,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate end-to-end F1 on the validation images.")
     parser.add_argument("--images-dir", type=Path, required=True)
     parser.add_argument("--detector-weights", type=Path, required=True)
+    parser.add_argument("--detector-backend", type=str, default="yolo", choices=["yolo", "rfdetr", "edgecrafter"])
+    parser.add_argument(
+        "--edgecrafter-config",
+        type=Path,
+        default=Path("/mnt/data/hejiakai/external_src/EdgeCrafter-main/ecdetseg/configs/ecdet/ecdet_m_sais_probe.yml"),
+    )
     parser.add_argument("--classifier-weights", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True, help="Raw competition root with XML files.")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -198,7 +231,9 @@ def load_ground_truth(xml_path: Path) -> list[Item]:
 class Recognizer:
     def __init__(
         self,
+        detector_backend: str,
         detector_weights: Path,
+        edgecrafter_config: Path,
         classifier_weights: Path,
         device: str,
         det_conf: float,
@@ -214,8 +249,20 @@ class Recognizer:
         slice_merge_iou: float,
         det_tta_mode: str,
     ) -> None:
-        self.detector = YOLO(str(detector_weights))
+        self.detector_backend = detector_backend
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        if detector_backend == "yolo":
+            self.detector = YOLO(str(detector_weights))
+        elif detector_backend == "rfdetr":
+            from rfdetr import from_checkpoint as rfdetr_from_checkpoint
+            self.detector = rfdetr_from_checkpoint(str(detector_weights))
+        elif detector_backend == "edgecrafter":
+            if not EDGECRAFTER_ROOT.exists():
+                raise FileNotFoundError(f"EdgeCrafter root not found: {EDGECRAFTER_ROOT}")
+            self.detector = EdgeCrafterDeployedModel(edgecrafter_config, detector_weights).to(self.device)
+            self.detector.eval()
+        else:
+            raise ValueError(f"Unsupported detector backend: {detector_backend}")
         ckpt = torch.load(classifier_weights, map_location="cpu", weights_only=False)
         label_map: dict[str, int] = ckpt["label_map"]
         checkpoint_args = ckpt.get("args", {})
@@ -252,6 +299,13 @@ class Recognizer:
                 transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
             ]
         )
+        self.edgecrafter_transform = transforms.Compose(
+            [
+                transforms.Resize(self.detector.eval_spatial_size if detector_backend == "edgecrafter" else (self.det_imgsz, self.det_imgsz)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
     def _expand_box(self, x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> list[int]:
         box_w = max(1.0, x2 - x1)
@@ -268,23 +322,75 @@ class Recognizer:
         return 0 if self.device.type == "cuda" else "cpu"
 
     def _predict_raw_boxes(self, image: Image.Image, imgsz: int) -> list[DetectionBox]:
-        prediction = self.detector.predict(
-            source=image,
-            conf=self.det_conf,
-            iou=self.det_iou,
-            imgsz=imgsz,
-            device=self._detector_device(),
-            verbose=False,
-        )[0]
-        if prediction.boxes is None:
+        if self.detector_backend == "yolo":
+            prediction = self.detector.predict(
+                source=image,
+                conf=self.det_conf,
+                iou=self.det_iou,
+                imgsz=imgsz,
+                device=self._detector_device(),
+                verbose=False,
+            )[0]
+            if prediction.boxes is None:
+                return []
+
+            coords = prediction.boxes.xyxy.tolist()
+            scores = prediction.boxes.conf.tolist()
+            boxes: list[DetectionBox] = []
+            for (x1, y1, x2, y2), score in zip(coords, scores):
+                boxes.append(
+                    DetectionBox(
+                        bbox=xyxy_to_xywh(
+                            [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+                        ),
+                        score=float(score),
+                    )
+                )
+            return boxes
+
+        if self.detector_backend == "edgecrafter":
+            width, height = image.size
+            spatial_size = (imgsz, imgsz) if imgsz > 0 else self.detector.eval_spatial_size
+            transform = transforms.Compose(
+                [
+                    transforms.Resize(spatial_size),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
+            tensor = transform(image).unsqueeze(0).to(self.device)
+            orig_sizes = torch.tensor([[width, height]], device=self.device)
+            with torch.inference_mode():
+                outputs = self.detector(tensor, orig_sizes)
+            if self.detector.task == "segmentation":
+                labels, pred_boxes, pred_scores, _ = outputs
+            else:
+                labels, pred_boxes, pred_scores = outputs
+            keep = pred_scores[0] > self.det_conf
+            if keep.sum().item() == 0:
+                return []
+            boxes = []
+            for xyxy, score in zip(pred_boxes[0][keep], pred_scores[0][keep]):
+                x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy.tolist()]
+                boxes.append(DetectionBox(bbox=xyxy_to_xywh([x1, y1, x2, y2]), score=float(score.item())))
+            return nms_boxes(boxes, iou_threshold=self.det_iou)
+
+        detections = self.detector.predict(
+            image,
+            threshold=self.det_conf,
+            shape=(imgsz, imgsz),
+            include_source_image=False,
+        )
+        if len(detections) == 0:
             return []
 
-        coords = prediction.boxes.xyxy.tolist()
-        scores = prediction.boxes.conf.tolist()
         boxes: list[DetectionBox] = []
-        for (x1, y1, x2, y2), score in zip(coords, scores):
-            boxes.append(DetectionBox(bbox=xyxy_to_xywh([int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]), score=float(score)))
-        return boxes
+        xyxy_array = detections.xyxy
+        conf_array = detections.confidence
+        for xyxy, score in zip(xyxy_array, conf_array):
+            x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy.tolist()]
+            boxes.append(DetectionBox(bbox=xyxy_to_xywh([x1, y1, x2, y2]), score=float(score)))
+        return nms_boxes(boxes, iou_threshold=self.det_iou)
 
     def _predict_full_image_boxes(self, rgb: Image.Image) -> list[DetectionBox]:
         image_width, _ = rgb.size
@@ -298,13 +404,22 @@ class Recognizer:
                     x = image_width - (x + w)
                 all_boxes.append(DetectionBox(bbox=[x, y, w, h], score=box.score))
 
-        add_view_boxes(rgb, imgsz=self.det_imgsz, flipped=False)
+        planned_views: list[tuple[int, bool]] = [(self.det_imgsz, False)]
         if self.det_tta_mode in {"hflip", "hflip+scale1536"}:
-            add_view_boxes(rgb.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=self.det_imgsz, flipped=True)
+            planned_views.append((self.det_imgsz, True))
         if self.det_tta_mode in {"scale1536", "hflip+scale1536"}:
-            add_view_boxes(rgb, imgsz=1536, flipped=False)
+            planned_views.append((1536, False))
         if self.det_tta_mode == "hflip+scale1536":
-            add_view_boxes(rgb.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=1536, flipped=True)
+            planned_views.append((1536, True))
+
+        seen_views: set[tuple[int, bool]] = set()
+        flipped_rgb = rgb.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        for imgsz, flipped in planned_views:
+            key = (imgsz, flipped)
+            if key in seen_views:
+                continue
+            seen_views.add(key)
+            add_view_boxes(flipped_rgb if flipped else rgb, imgsz=imgsz, flipped=flipped)
         return all_boxes
 
     def _predict_sliced_boxes(self, rgb: Image.Image) -> list[DetectionBox]:
@@ -419,7 +534,9 @@ def match_counts(preds: list[Item], gts: list[Item], iou_threshold: float) -> tu
 def main() -> None:
     args = parse_args()
     recognizer = Recognizer(
+        detector_backend=args.detector_backend,
         detector_weights=args.detector_weights,
+        edgecrafter_config=args.edgecrafter_config,
         classifier_weights=args.classifier_weights,
         device=args.device,
         det_conf=args.det_conf,

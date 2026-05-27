@@ -292,13 +292,24 @@ class AncientCharRecognizer:
                     x = image_width - (x + w)
                 boxes.append(DetectionBox(bbox=[x, y, w, h], score=box.score))
 
-        add_view(rgb_image, imgsz=DETECT_IMGSZ, flipped=False)
+        # Deduplicate views so DETECT_IMGSZ=1536 with DET_TTA_MODE=scale1536
+        # does not run the exact same pass twice and inflate FP.
+        planned_views: list[tuple[int, bool]] = [(DETECT_IMGSZ, False)]
         if DET_TTA_MODE in {"hflip", "hflip+scale1536"}:
-            add_view(rgb_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=DETECT_IMGSZ, flipped=True)
+            planned_views.append((DETECT_IMGSZ, True))
         if DET_TTA_MODE in {"scale1536", "hflip+scale1536"}:
-            add_view(rgb_image, imgsz=1536, flipped=False)
+            planned_views.append((1536, False))
         if DET_TTA_MODE == "hflip+scale1536":
-            add_view(rgb_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), imgsz=1536, flipped=True)
+            planned_views.append((1536, True))
+
+        seen_views: set[tuple[int, bool]] = set()
+        flipped_image = rgb_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        for imgsz, flipped in planned_views:
+            key = (imgsz, flipped)
+            if key in seen_views:
+                continue
+            seen_views.add(key)
+            add_view(flipped_image if flipped else rgb_image, imgsz=imgsz, flipped=flipped)
         return boxes
 
     def _predict_sliced_boxes(self, rgb_image: Image.Image) -> list[DetectionBox]:
