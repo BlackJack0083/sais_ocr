@@ -18,7 +18,8 @@ from ultralytics import YOLO
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-INPUT_DIR = Path(os.getenv("INPUT_DIR", "/saisdata"))
+DEFAULT_INPUT_DIR = "/saisdata/50/eval/images"
+INPUT_DIR = Path(os.getenv("INPUT_DIR", DEFAULT_INPUT_DIR))
 OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "/saisresult/prediction.json"))
 DETECTOR_WEIGHTS = Path(os.getenv("DETECTOR_WEIGHTS", "/app/models/detector_best.pt"))
 CLASSIFIER_WEIGHTS = Path(os.getenv("CLASSIFIER_WEIGHTS", "/app/models/classifier_best.pt"))
@@ -49,12 +50,19 @@ def choose_device() -> str:
 def find_images() -> list[Path]:
     suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
-    if INPUT_DIR.exists():
-        return sorted(path for path in INPUT_DIR.rglob("*") if path.suffix.lower() in suffixes)
-
-    fallback_root = Path("/saisdata")
-    if fallback_root.exists():
-        return sorted(path for path in fallback_root.rglob("*") if path.suffix.lower() in suffixes)
+    candidate_dirs = [
+        INPUT_DIR,
+        Path("/saisdata/50/eval/images"),
+        Path("/saisdata/eval/images"),
+        Path("/saisdata"),
+    ]
+    seen: set[Path] = set()
+    for candidate in candidate_dirs:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return sorted(path for path in candidate.rglob("*") if path.suffix.lower() in suffixes)
 
     return []
 

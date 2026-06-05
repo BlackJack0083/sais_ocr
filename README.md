@@ -6,7 +6,7 @@
 
 ## 输入输出
 
-- 输入目录：`/saisdata`
+- 输入目录：`/saisdata/50/eval/images/`
 - 输出文件：`/saisresult/prediction.json`
 - 输出格式：
 
@@ -57,6 +57,13 @@ DETECTOR_WEIGHTS=./models/detector_best.pt \
 CLASSIFIER_WEIGHTS=./models/classifier_best.pt \
 python3 src/run_inference.py
 ```
+
+当前默认会优先读取：
+- `/saisdata/50/eval/images/`
+
+同时保留旧路径兜底：
+- `/saisdata/eval/images/`
+- `/saisdata/`
 
 当前默认推理参数已经调到一组更优的本地验证配置：
 - `DETECT_CONF=0.08`
