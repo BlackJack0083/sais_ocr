@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep end-to-end detector/classifier thresholds on local val.")
     parser.add_argument("--images-dir", type=Path, required=True)
     parser.add_argument("--detector-weights", type=Path, required=True)
+    parser.add_argument("--detector-backend", type=str, default="yolo", choices=["yolo", "rfdetr", "edgecrafter"])
+    parser.add_argument(
+        "--edgecrafter-config",
+        type=Path,
+        default=Path("/mnt/data/hejiakai/external_src/EdgeCrafter-main/ecdetseg/configs/ecdet/ecdet_m_sais_probe.yml"),
+    )
     parser.add_argument("--classifier-weights", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -49,6 +55,10 @@ def build_command(args: argparse.Namespace, config: dict[str, float]) -> list[st
         str(args.images_dir),
         "--detector-weights",
         str(args.detector_weights),
+        "--detector-backend",
+        args.detector_backend,
+        "--edgecrafter-config",
+        str(args.edgecrafter_config),
         "--classifier-weights",
         str(args.classifier_weights),
         "--source-root",

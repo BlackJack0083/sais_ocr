@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from PIL import Image, ImageFile, ImageOps
+from PIL import Image, ImageFile, ImageOps, ImageStat
 from torch import nn
 from torch.nn import functional as F
 from torchvision import models, transforms
@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slice-merge-iou", type=float, default=0.50)
     parser.add_argument("--det-tta-mode", type=str, default="none")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument("--polarity-normalization", type=str, default="auto", choices=["off", "auto"])
     return parser.parse_args()
 
 
@@ -129,6 +130,41 @@ def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 25
     pad_right = side - width - pad_left
     pad_bottom = side - height - pad_top
     return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
+
+
+def estimate_border_mean(gray: Image.Image) -> float:
+    width, height = gray.size
+    if width < 4 or height < 4:
+        return float(ImageStat.Stat(gray).mean[0])
+    border = max(1, min(width, height) // 12)
+    strips = [
+        gray.crop((0, 0, width, border)),
+        gray.crop((0, height - border, width, height)),
+        gray.crop((0, border, border, height - border)),
+        gray.crop((width - border, border, width, height - border)),
+    ]
+    total_weight = 0
+    total_value = 0.0
+    for strip in strips:
+        stat = ImageStat.Stat(strip)
+        weight = strip.size[0] * strip.size[1]
+        total_weight += weight
+        total_value += float(stat.mean[0]) * weight
+    if total_weight == 0:
+        return float(ImageStat.Stat(gray).mean[0])
+    return total_value / total_weight
+
+
+def normalize_image_polarity(image: Image.Image, mode: str) -> Image.Image:
+    if mode == "off":
+        return image
+    rgb = image.convert("RGB") if image.mode != "RGB" else image.copy()
+    gray = rgb.convert("L")
+    border_mean = estimate_border_mean(gray)
+    overall_mean = float(ImageStat.Stat(gray).mean[0])
+    if border_mean + 4.0 < overall_mean:
+        return ImageOps.invert(rgb)
+    return rgb
 
 
 def parse_position(raw: str) -> list[int] | None:
@@ -248,6 +284,7 @@ class Recognizer:
         slice_overlap: int,
         slice_merge_iou: float,
         det_tta_mode: str,
+        polarity_normalization: str,
     ) -> None:
         self.detector_backend = detector_backend
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -291,8 +328,10 @@ class Recognizer:
         self.slice_overlap = slice_overlap
         self.slice_merge_iou = slice_merge_iou
         self.det_tta_mode = det_tta_mode
+        self.polarity_normalization = polarity_normalization
         self.transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: normalize_image_polarity(image, mode=self.polarity_normalization)),
                 transforms.Lambda(pad_to_square),
                 transforms.Resize((self.classifier_img_size, self.classifier_img_size)),
                 transforms.ToTensor(),
@@ -551,6 +590,7 @@ def main() -> None:
         slice_overlap=args.slice_overlap,
         slice_merge_iou=args.slice_merge_iou,
         det_tta_mode=args.det_tta_mode,
+        polarity_normalization=args.polarity_normalization,
     )
 
     total_tp = total_fp = total_fn = 0

@@ -8,31 +8,37 @@ import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import torch
-from PIL import Image, ImageFile, ImageOps
+from PIL import Image, ImageFile, ImageOps, ImageStat
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm import tqdm
+from transformers import Dinov2Model
 
 
 IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
 IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Unicode character classifier with EfficientNet-B0 + ArcFace.")
+    parser = argparse.ArgumentParser(description="Train a Unicode character classifier with a selectable backbone + ArcFace.")
     parser.add_argument("--train-json", type=Path, required=True)
     parser.add_argument("--val-json", type=Path, required=True)
     parser.add_argument("--label-map", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--backbone", type=str, default="efficientnet_b0", choices=["efficientnet_b0", "dinov2_small"])
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--img-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--backbone-lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
@@ -44,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-balanced-sampler", type=str, default="none", choices=["none", "inv_sqrt"])
     parser.add_argument("--loss", type=str, default="cross_entropy", choices=["cross_entropy", "balanced_softmax"])
     parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--polarity-normalization",
+        type=str,
+        default="auto",
+        choices=["off", "auto"],
+        help="Normalize crop polarity so dark-background light-foreground crops are inverted to a consistent style.",
+    )
     parser.add_argument("--resume-from", type=Path, default=None, help="Resume full training state from a previous checkpoint.")
     parser.add_argument(
         "--reset-best-on-resume",
@@ -71,12 +85,23 @@ class Sample:
 
 
 class JsonImageDataset(Dataset):
-    def __init__(self, json_path: Path, img_size: int, train: bool) -> None:
+    def __init__(
+        self,
+        json_path: Path,
+        img_size: int,
+        train: bool,
+        mean: Sequence[float],
+        std: Sequence[float],
+        polarity_normalization: str,
+    ) -> None:
         data = json.loads(json_path.read_text(encoding="utf-8"))
         self.samples = [Sample(path=item["path"], label=int(item["label"])) for item in data]
         self.raw_items = data
         self.path_exists = [bool(sample.path) and Path(sample.path).exists() for sample in self.samples]
-        base = [transforms.Lambda(lambda image: pad_to_square(image))]
+        base = [
+            transforms.Lambda(lambda image: normalize_image_polarity(image, mode=polarity_normalization)),
+            transforms.Lambda(lambda image: pad_to_square(image)),
+        ]
         if train:
             base.extend(
                 [
@@ -87,7 +112,7 @@ class JsonImageDataset(Dataset):
             [
                 transforms.Resize((img_size, img_size)),
                 transforms.ToTensor(),
-                transforms.Normalize(IMAGE_MEAN, IMAGE_STD),
+                transforms.Normalize(mean, std),
             ]
         )
         self.transform = transforms.Compose(base)
@@ -130,6 +155,42 @@ def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 25
     return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
 
 
+def estimate_border_mean(gray: Image.Image) -> float:
+    width, height = gray.size
+    if width < 4 or height < 4:
+        return float(ImageStat.Stat(gray).mean[0])
+    border = max(1, min(width, height) // 12)
+    strips = [
+        gray.crop((0, 0, width, border)),
+        gray.crop((0, height - border, width, height)),
+        gray.crop((0, border, border, height - border)),
+        gray.crop((width - border, border, width, height - border)),
+    ]
+    total_weight = 0
+    total_value = 0.0
+    for strip in strips:
+        stat = ImageStat.Stat(strip)
+        weight = strip.size[0] * strip.size[1]
+        total_weight += weight
+        total_value += float(stat.mean[0]) * weight
+    if total_weight == 0:
+        return float(ImageStat.Stat(gray).mean[0])
+    return total_value / total_weight
+
+
+def normalize_image_polarity(image: Image.Image, mode: str) -> Image.Image:
+    if mode == "off":
+        return image
+    rgb = image.convert("RGB") if image.mode != "RGB" else image.copy()
+    gray = rgb.convert("L")
+    border_mean = estimate_border_mean(gray)
+    overall_mean = float(ImageStat.Stat(gray).mean[0])
+    # Dark borders with a brighter interior usually mean black background + light glyph.
+    if border_mean + 4.0 < overall_mean:
+        return ImageOps.invert(rgb)
+    return rgb
+
+
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.35) -> None:
         super().__init__()
@@ -152,6 +213,10 @@ class ArcMarginProduct(nn.Module):
         logits = one_hot * phi + (1.0 - one_hot) * cosine
         return logits * self.s
 
+    def infer(self, embeddings: torch.Tensor) -> torch.Tensor:
+        cosine = F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        return cosine * self.s
+
 
 class EfficientNetArcFace(nn.Module):
     def __init__(self, embedding_dim: int) -> None:
@@ -172,6 +237,26 @@ class EfficientNetArcFace(nn.Module):
         return F.normalize(embeddings)
 
 
+class Dinov2ArcFace(nn.Module):
+    def __init__(self, embedding_dim: int, gradient_checkpointing: bool = False) -> None:
+        super().__init__()
+        backbone = Dinov2Model.from_pretrained("facebook/dinov2-small")
+        if gradient_checkpointing:
+            backbone.gradient_checkpointing_enable()
+        self.backbone = backbone
+        hidden_size = int(backbone.config.hidden_size)
+        self.embedding = nn.Sequential(
+            nn.Linear(hidden_size, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        outputs = self.backbone(pixel_values=x)
+        cls_token = outputs.last_hidden_state[:, 0]
+        embeddings = self.embedding(cls_token)
+        return F.normalize(embeddings)
+
+
 class BalancedSoftmaxLoss(nn.Module):
     def __init__(self, class_counts: list[int]) -> None:
         super().__init__()
@@ -184,7 +269,7 @@ class BalancedSoftmaxLoss(nn.Module):
         return F.cross_entropy(adjusted_logits, labels)
 
 
-def load_backbone_init(model: EfficientNetArcFace, init_path: Path | None) -> None:
+def load_backbone_init(model: nn.Module, init_path: Path | None) -> None:
     if init_path is None:
         return
     checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
@@ -198,7 +283,7 @@ def load_backbone_init(model: EfficientNetArcFace, init_path: Path | None) -> No
 
 
 def load_resume_checkpoint(
-    model: EfficientNetArcFace,
+    model: nn.Module,
     arcface: ArcMarginProduct,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
@@ -224,6 +309,21 @@ def load_resume_checkpoint(
     return start_epoch, best_val_acc, history
 
 
+def build_model(args: argparse.Namespace) -> nn.Module:
+    if args.backbone == "dinov2_small":
+        return Dinov2ArcFace(
+            embedding_dim=args.embedding_dim,
+            gradient_checkpointing=args.gradient_checkpointing,
+        )
+    return EfficientNetArcFace(embedding_dim=args.embedding_dim)
+
+
+def get_dataset_stats(backbone: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    if backbone == "dinov2_small":
+        return IMAGENET_MEAN, IMAGENET_STD
+    return IMAGE_MEAN, IMAGE_STD
+
+
 def evaluate(
     model: nn.Module,
     arcface: ArcMarginProduct,
@@ -240,10 +340,11 @@ def evaluate(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             embeddings = model(images)
-            logits = arcface(embeddings, labels)
-            loss = criterion(logits, labels)
+            train_logits = arcface(embeddings, labels)
+            infer_logits = arcface.infer(embeddings)
+            loss = criterion(train_logits, labels)
             total_loss += loss.item() * images.size(0)
-            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            total_correct += (infer_logits.argmax(dim=1) == labels).sum().item()
             total += images.size(0)
     return total_loss / max(total, 1), total_correct / max(total, 1)
 
@@ -257,8 +358,23 @@ def main() -> None:
     num_classes = len(label_map)
     print(f"Loaded label map with {num_classes} classes.", flush=True)
 
-    train_dataset = JsonImageDataset(args.train_json, args.img_size, train=True)
-    val_dataset = JsonImageDataset(args.val_json, args.img_size, train=False)
+    mean, std = get_dataset_stats(args.backbone)
+    train_dataset = JsonImageDataset(
+        args.train_json,
+        args.img_size,
+        train=True,
+        mean=mean,
+        std=std,
+        polarity_normalization=args.polarity_normalization,
+    )
+    val_dataset = JsonImageDataset(
+        args.val_json,
+        args.img_size,
+        train=False,
+        mean=mean,
+        std=std,
+        polarity_normalization=args.polarity_normalization,
+    )
     print(f"Loaded datasets: train={len(train_dataset)} val={len(val_dataset)}", flush=True)
 
     sampler = None
@@ -281,19 +397,22 @@ def main() -> None:
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-    )
+    has_val = len(val_dataset) > 0
+    val_loader = None
+    if has_val:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+        )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}", flush=True)
 
-    model = EfficientNetArcFace(embedding_dim=args.embedding_dim)
+    model = build_model(args)
     arcface = ArcMarginProduct(
         in_features=args.embedding_dim,
         out_features=num_classes,
@@ -316,9 +435,18 @@ def main() -> None:
         criterion = BalancedSoftmaxLoss(class_counts=class_counts)
     else:
         criterion = nn.CrossEntropyLoss()
+    backbone_lr = args.backbone_lr if args.backbone_lr is not None else args.lr
+    backbone_params = [parameter for parameter in model.backbone.parameters() if parameter.requires_grad]
+    head_params = [
+        parameter
+        for parameter in list(model.embedding.parameters()) + list(arcface.parameters())
+        if parameter.requires_grad
+    ]
     optimizer = torch.optim.AdamW(
-        [parameter for parameter in list(model.parameters()) + list(arcface.parameters()) if parameter.requires_grad],
-        lr=args.lr,
+        [
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": head_params, "lr": args.lr},
+        ],
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -331,6 +459,8 @@ def main() -> None:
         resume_path=args.resume_from,
         resume_optimizer_state=args.resume_optimizer_state,
     )
+    if not has_val:
+        best_val_acc = float("-inf")
     if args.reset_best_on_resume:
         best_val_acc = 0.0
         print("Reset best validation accuracy after resume.", flush=True)
@@ -350,13 +480,14 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             embeddings = model(images)
-            logits = arcface(embeddings, labels)
-            loss = criterion(logits, labels)
+            train_logits = arcface(embeddings, labels)
+            infer_logits = arcface.infer(embeddings)
+            loss = criterion(train_logits, labels)
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item() * images.size(0)
-            running_correct += (logits.argmax(dim=1) == labels).sum().item()
+            running_correct += (infer_logits.argmax(dim=1) == labels).sum().item()
             running_total += images.size(0)
             progress.set_postfix(
                 loss=f"{running_loss / max(running_total, 1):.4f}",
@@ -367,7 +498,10 @@ def main() -> None:
 
         train_loss = running_loss / max(running_total, 1)
         train_acc = running_correct / max(running_total, 1)
-        val_loss, val_acc = evaluate(model, arcface, val_loader, criterion, device)
+        if has_val and val_loader is not None:
+            val_loss, val_acc = evaluate(model, arcface, val_loader, criterion, device)
+        else:
+            val_loss, val_acc = 0.0, 0.0
         record = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -376,6 +510,8 @@ def main() -> None:
             "val_acc": val_acc,
             "lr": scheduler.get_last_lr()[0],
         }
+        if not has_val:
+            record["note"] = "fulltrain_no_val"
         history.append(record)
         print(record, flush=True)
 
@@ -390,12 +526,15 @@ def main() -> None:
             "history": history,
         }
         torch.save(checkpoint, args.output_dir / "last.pt")
-        if val_acc >= best_val_acc:
+        if (not has_val) or (val_acc >= best_val_acc):
             best_val_acc = val_acc
             torch.save(checkpoint, args.output_dir / "best.pt")
 
     (args.output_dir / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Training finished. Best val acc: {best_val_acc:.4f}")
+    if has_val:
+        print(f"Training finished. Best val acc: {best_val_acc:.4f}")
+    else:
+        print("Training finished. Fulltrain run saved last.pt and rolling best.pt without validation.")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@
 
 | 时间 | commit | detector | classifier | 说明 |
 | --- | --- | --- | --- | --- |
-| 2026-05-27 | `64d66dc` | YOLOv8m allboxes group 1536 e40 best | group-val + HUST035 + Chronicles-tail best | 当前待测新版本；我已把 `models/` 与默认 `DETECT_IMGSZ=1536` 同步到这条线 |
+| 2026-05-27 | `64d66dc` / `917b3f4` | YOLOv8m allboxes group 1536 e40 best | group-val + HUST035 + Chronicles-tail best | 已完成两次线上测试；`917b3f4` 的 TTA 去重修复未改变实际输出，线上结果仍为 `0.181603` |
 
 ## 阶段总结
 
@@ -82,6 +82,5 @@
   - `group_lastpt_online_user_report`
   - `F1 = 0.195015`
 - 当前最值得观察的新版本是：
-  - `64d66dc`
-  - `allboxes group 1536 e40 detector + chron-tail stable classifier`
-
+  - 当前已验证 `allboxes group 1536 e40 detector + chron-tail stable classifier` 在线上只有 `0.181603`
+  - 因此它暂时不能替代 `group_lastpt_online_user_report`

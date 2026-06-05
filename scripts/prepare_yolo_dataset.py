@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import shutil
 import xml.etree.ElementTree as ET
@@ -34,6 +35,12 @@ def parse_args() -> argparse.Namespace:
         default="random",
         choices=["random", "group"],
         help="How to split train/val. 'group' keeps same source groups in only one split.",
+    )
+    parser.add_argument(
+        "--filter-non-single-text",
+        action="store_true",
+        help="If set, only keep labels whose XML text decodes to a single character. "
+        "Leave off for detector training so all valid ancient-character boxes are kept.",
     )
     return parser.parse_args()
 
@@ -103,7 +110,7 @@ def find_image_for_xml(xml_path: Path) -> Path | None:
     return None
 
 
-def parse_xml(xml_path: Path) -> Sample | None:
+def parse_xml(xml_path: Path, filter_non_single_text: bool) -> Sample | None:
     image_path = find_image_for_xml(xml_path)
     if image_path is None:
         return None
@@ -117,8 +124,7 @@ def parse_xml(xml_path: Path) -> Sample | None:
 
     for char_elem in root.iter("char"):
         text_value = (char_elem.text or "").strip()
-        # Keep only labels that decode to a single Unicode code point.
-        if len(text_value) != 1:
+        if filter_non_single_text and len(text_value) != 1:
             continue
         position = char_elem.attrib.get("position", "")
         bbox = parse_position(position)
@@ -214,7 +220,7 @@ def main() -> None:
     skipped_empty = 0
 
     for index, xml_path in enumerate(xml_paths, start=1):
-        sample = parse_xml(xml_path)
+        sample = parse_xml(xml_path, filter_non_single_text=args.filter_non_single_text)
         if sample is None:
             if find_image_for_xml(xml_path) is None:
                 skipped_missing_image += 1
@@ -249,6 +255,21 @@ def main() -> None:
     materialize("val", val_samples)
     write_dataset_yaml(output_root)
 
+    summary = {
+        "valid_samples": len(samples),
+        "train_samples": len(train_samples),
+        "val_samples": len(val_samples),
+        "skipped_missing_image": skipped_missing_image,
+        "skipped_empty": skipped_empty,
+        "split_mode": args.split_mode,
+        "val_ratio": args.val_ratio,
+        "seed": args.seed,
+        "filter_non_single_text": args.filter_non_single_text,
+        "copy_images": args.copy_images,
+        "source_root": str(source_root.resolve()),
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print(f"Valid samples: {len(samples)}")
     print(f"Train samples: {len(train_samples)}")
     print(f"Val samples: {len(val_samples)}")
@@ -256,6 +277,7 @@ def main() -> None:
     print(f"Skipped XML without valid boxes: {skipped_empty}")
     print(f"Split mode: {args.split_mode}")
     print(f"Dataset YAML: {output_root / 'dataset.yaml'}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,132 @@
+Global:
+  use_gpu: true
+  use_xpu: false
+  use_mlu: false
+  epoch_num: 300
+  log_smooth_window: 20
+  print_batch_step: 20
+  save_model_dir: /mnt/data/hejiakai/sais_ocr/runs/paddleocr_det_mv3_db
+  save_epoch_step: 10
+  eval_batch_step: [0, 500]
+  cal_metric_during_train: false
+  pretrained_model:
+  checkpoints:
+  save_inference_dir:
+  use_visualdl: false
+  infer_img: /mnt/data/hejiakai/sais_ocr/data/processed/paddleocr_det_group/val/images
+  save_res_path: /mnt/data/hejiakai/sais_ocr/runs/paddleocr_det_mv3_db/predicts_db.txt
+
+Architecture:
+  model_type: det
+  algorithm: DB
+  Transform:
+  Backbone:
+    name: MobileNetV3
+    scale: 0.5
+    model_name: large
+  Neck:
+    name: DBFPN
+    out_channels: 256
+  Head:
+    name: DBHead
+    k: 50
+
+Loss:
+  name: DBLoss
+  balance_loss: true
+  main_loss_type: DiceLoss
+  alpha: 5
+  beta: 10
+  ohem_ratio: 3
+
+Optimizer:
+  name: Adam
+  beta1: 0.9
+  beta2: 0.999
+  lr:
+    learning_rate: 0.001
+  regularizer:
+    name: L2
+    factor: 0
+
+PostProcess:
+  name: DBPostProcess
+  thresh: 0.3
+  box_thresh: 0.6
+  max_candidates: 1000
+  unclip_ratio: 1.5
+
+Metric:
+  name: DetMetric
+  main_indicator: hmean
+
+Train:
+  dataset:
+    name: SimpleDataSet
+    data_dir: /mnt/data/hejiakai/sais_ocr/data/processed/paddleocr_det_group
+    label_file_list:
+      - /mnt/data/hejiakai/sais_ocr/data/processed/paddleocr_det_group/train_label.txt
+    ratio_list: [1.0]
+    transforms:
+      - DecodeImage:
+          img_mode: BGR
+          channel_first: false
+      - DetLabelEncode:
+      - IaaAugment:
+          augmenter_args:
+            - { type: Fliplr, args: { p: 0.5 } }
+            - { type: Affine, args: { rotate: [-10, 10] } }
+            - { type: Resize, args: { size: [0.8, 1.2] } }
+      - EastRandomCropData:
+          size: [960, 960]
+          max_tries: 50
+          keep_ratio: true
+      - MakeBorderMap:
+          shrink_ratio: 0.4
+          thresh_min: 0.3
+          thresh_max: 0.7
+      - MakeShrinkMap:
+          shrink_ratio: 0.4
+          min_text_size: 4
+      - NormalizeImage:
+          scale: 1./255.
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+          order: hwc
+      - ToCHWImage:
+      - KeepKeys:
+          keep_keys: ['image', 'threshold_map', 'threshold_mask', 'shrink_map', 'shrink_mask']
+  loader:
+    shuffle: true
+    drop_last: false
+    batch_size_per_card: 8
+    num_workers: 4
+    use_shared_memory: false
+
+Eval:
+  dataset:
+    name: SimpleDataSet
+    data_dir: /mnt/data/hejiakai/sais_ocr/data/processed/paddleocr_det_group
+    label_file_list:
+      - /mnt/data/hejiakai/sais_ocr/data/processed/paddleocr_det_group/val_label.txt
+    transforms:
+      - DecodeImage:
+          img_mode: BGR
+          channel_first: false
+      - DetLabelEncode:
+      - DetResizeForTest:
+          image_shape: [960, 960]
+      - NormalizeImage:
+          scale: 1./255.
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+          order: hwc
+      - ToCHWImage:
+      - KeepKeys:
+          keep_keys: ['image', 'shape', 'polys', 'ignore_tags']
+  loader:
+    shuffle: false
+    drop_last: false
+    batch_size_per_card: 1
+    num_workers: 2
+    use_shared_memory: false

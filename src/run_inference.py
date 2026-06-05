@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-from PIL import Image, ImageFile, ImageOps
+from PIL import Image, ImageFile, ImageOps, ImageStat
 from torch import nn
 from torch.nn import functional as F
 from torchvision import models, transforms
@@ -37,6 +37,7 @@ SLICE_SIZE = int(os.getenv("SLICE_SIZE", "0"))
 SLICE_OVERLAP = int(os.getenv("SLICE_OVERLAP", "0"))
 SLICE_MERGE_IOU = float(os.getenv("SLICE_MERGE_IOU", "0.50"))
 DET_TTA_MODE = os.getenv("DET_TTA_MODE", "scale1536")
+POLARITY_NORMALIZATION = os.getenv("POLARITY_NORMALIZATION", "auto").strip().lower()
 IMAGE_MEAN = (0.85233593, 0.85246795, 0.8517555)
 IMAGE_STD = (0.31232414, 0.3122127, 0.31273854)
 
@@ -122,6 +123,41 @@ def pad_to_square(image: Image.Image, fill: tuple[int, int, int] = (255, 255, 25
     return ImageOps.expand(image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=fill)
 
 
+def estimate_border_mean(gray: Image.Image) -> float:
+    width, height = gray.size
+    if width < 4 or height < 4:
+        return float(ImageStat.Stat(gray).mean[0])
+    border = max(1, min(width, height) // 12)
+    strips = [
+        gray.crop((0, 0, width, border)),
+        gray.crop((0, height - border, width, height)),
+        gray.crop((0, border, border, height - border)),
+        gray.crop((width - border, border, width, height - border)),
+    ]
+    total_weight = 0
+    total_value = 0.0
+    for strip in strips:
+        stat = ImageStat.Stat(strip)
+        weight = strip.size[0] * strip.size[1]
+        total_weight += weight
+        total_value += float(stat.mean[0]) * weight
+    if total_weight == 0:
+        return float(ImageStat.Stat(gray).mean[0])
+    return total_value / total_weight
+
+
+def normalize_image_polarity(image: Image.Image, mode: str) -> Image.Image:
+    if mode == "off":
+        return image
+    rgb = image.convert("RGB") if image.mode != "RGB" else image.copy()
+    gray = rgb.convert("L")
+    border_mean = estimate_border_mean(gray)
+    overall_mean = float(ImageStat.Stat(gray).mean[0])
+    if border_mean + 4.0 < overall_mean:
+        return ImageOps.invert(rgb)
+    return rgb
+
+
 def iou_xywh(a: list[int], b: list[int]) -> float:
     ax1, ay1, aw, ah = a
     bx1, by1, bw, bh = b
@@ -198,6 +234,7 @@ class AncientCharRecognizer:
         self.idx_to_text = self._build_idx_to_text(label_map)
         self.transform = transforms.Compose(
             [
+                transforms.Lambda(lambda image: normalize_image_polarity(image, mode=POLARITY_NORMALIZATION)),
                 transforms.Lambda(pad_to_square),
                 transforms.Resize((self.classifier_img_size, self.classifier_img_size)),
                 transforms.ToTensor(),
@@ -396,6 +433,7 @@ def main() -> None:
     print(f"SLICE_OVERLAP={SLICE_OVERLAP}")
     print(f"SLICE_MERGE_IOU={SLICE_MERGE_IOU}")
     print(f"DET_TTA_MODE={DET_TTA_MODE}")
+    print(f"POLARITY_NORMALIZATION={POLARITY_NORMALIZATION}")
 
     if not image_paths:
         OUTPUT_FILE.write_text("{}", encoding="utf-8")
